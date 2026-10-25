@@ -127,6 +127,9 @@ the installed plugin:
 zig build install-au && zig build au-oop
 ```
 
+`zig build au-oop -- render 48000` also plays A4 through the out-of-process
+unit with AVAudioEngine and reports its level and measured pitch.
+
 ## Layout
 
 | Path | Contents |
