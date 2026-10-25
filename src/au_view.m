@@ -50,6 +50,10 @@ void mathsynth_au_view_gone(void *ctx);
 NSView *mathsynth_au_container_new(NSRect frame, void *ctx) {
     MATHSYNTH_VIEW_CONTAINER *view = [[MATHSYNTH_VIEW_CONTAINER alloc] initWithFrame:frame];
     view->ctx = ctx;
+    // Hosts that run the plugin out of process (GarageBand, Logic) show the
+    // view remotely, which only carries layer contents: without a layer the
+    // window stays empty.
+    view.wantsLayer = YES;
     return view;
 }
 

@@ -86,6 +86,17 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_au_host.addArgs(args);
     b.step("au-host", "Run the Audio Unit test host against the built bundle (pass args after --)").dependOn(&run_au_host.step);
 
+    // Loads the *installed* AU out of process, like GarageBand, and asks for
+    // its editor. Run `zig build install-au` first.
+    const oop_mod = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true });
+    oop_mod.addCSourceFile(.{ .file = b.path("tools/au_oop.m"), .flags = &.{"-fobjc-arc"} });
+    for ([_][]const u8{ "AppKit", "AudioToolbox", "CoreAudioKit", "AVFoundation" }) |f| oop_mod.linkFramework(f, .{});
+    const au_oop = b.addExecutable(.{ .name = "au-oop", .root_module = oop_mod });
+    b.installArtifact(au_oop);
+    const run_au_oop = b.addRunArtifact(au_oop);
+    if (b.args) |args| run_au_oop.addArgs(args);
+    b.step("au-oop", "Open the installed Audio Unit out of process and request its editor").dependOn(&run_au_oop.step);
+
     // Tests --------------------------------------------------------------------
 
     const test_step = b.step("test", "Run unit tests");

@@ -119,6 +119,14 @@ state goes through `ClassInfo`, notes through `MusicDeviceMIDIEvent`, and the
 editor is created through the `CocoaUI` view factory, the way Logic and
 GarageBand do it.
 
+GarageBand and Logic run third-party Audio Units in a separate helper process
+(`AUHostingService`) and show the editor remotely. To check that path against
+the installed plugin:
+
+```bash
+zig build install-au && zig build au-oop
+```
+
 ## Layout
 
 | Path | Contents |

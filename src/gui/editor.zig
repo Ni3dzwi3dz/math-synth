@@ -53,6 +53,9 @@ pub const Editor = struct {
         const root = msg(Id, objc.alloc(cls.root), "initWithFrame:", .{NSRect.make(0, 0, width, height)});
         objc.setUserdata(root, self);
         self.root = root;
+        // Layer-backed so the editor also shows up when a host displays it
+        // remotely (out-of-process plugins).
+        msg(void, root, "setWantsLayer:", .{objc.YES});
         const dark = objc.classMsg(Id, "NSAppearance", "appearanceNamed:", .{NSAppearanceNameDarkAqua});
         msg(void, root, "setAppearance:", .{dark});
 
