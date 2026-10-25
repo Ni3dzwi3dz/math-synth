@@ -1,0 +1,8 @@
+.{
+    .name = .math_synth,
+    .version = "0.1.0",
+    .fingerprint = 0x3269320863cae2b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "bundle", "vendor", "README.md" },
+}
