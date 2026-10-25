@@ -257,7 +257,7 @@ fn render(inst: Instance, path: [:0]const u8) void {
 
     var t: usize = 0;
     while (t < total) : (t += block) {
-        const n = @min(block, total - t);
+        const n: usize = @min(block, total - t);
         var events: EventList = .{};
         for (0..pitches.len + 1) |i| {
             const start = i * note_len;

@@ -8,7 +8,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("vst3");
 const wt = @import("wavetable.zig");
-const Synth = @import("synth.zig").Synth;
+const engine = @import("engine.zig");
+const Engine = engine.Engine;
 const gui = @import("gui/editor.zig");
 
 pub const name = "MathSynth";
@@ -141,13 +142,7 @@ const Plugin = struct {
     /// IEditController on a single-component plugin.
     init_count: u32 = 0,
 
-    synth: Synth = .{},
-    tables: wt.TripleBuffer = .{},
-
-    /// Guards `settings`, which the UI writes and getState may read from
-    /// another thread.
-    settings_lock: std.atomic.Value(bool) = .init(false),
-    settings: wt.Settings = wt.Settings.default,
+    engine: Engine = .{},
 
     handler: ?*c.struct_Steinberg_Vst_IComponentHandler = null,
     editor: ?*gui.Editor = null,
@@ -155,10 +150,7 @@ const Plugin = struct {
     fn create() !*Plugin {
         const p = try allocator.create(Plugin);
         p.* = .{};
-        var table: wt.Table = undefined;
-        std.debug.assert(wt.build(&p.settings, &table) == .ok);
-        p.tables.initWith(&table);
-        p.synth.setSampleRate(44100);
+        p.engine.init();
         return p;
     }
 
@@ -198,27 +190,10 @@ const Plugin = struct {
         p.handler = handler;
     }
 
-    fn lockSettings(p: *Plugin) void {
-        while (p.settings_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-    }
-    fn unlockSettings(p: *Plugin) void {
-        p.settings_lock.store(false, .release);
-    }
-
-    /// Stores validated settings and hands the matching table to the audio
-    /// thread.
-    fn apply(p: *Plugin, settings: *const wt.Settings, table: *const wt.Table) void {
-        p.tables.beginWrite().* = table.*;
-        p.tables.publish();
-        p.lockSettings();
-        p.settings = settings.*;
-        p.unlockSettings();
-    }
-
     /// Editor callback: the user typed a valid formula.
     fn applyFromEditor(ctx: *anyopaque, settings: *const wt.Settings, table: *const wt.Table) void {
         const p: *Plugin = @ptrCast(@alignCast(ctx));
-        p.apply(settings, table);
+        p.engine.apply(settings, table);
         p.markDirty();
     }
 
@@ -239,14 +214,14 @@ const Plugin = struct {
     }
 
     fn process(p: *Plugin, data: *c.struct_Steinberg_Vst_ProcessData) void {
-        const table = p.tables.read();
         const frames: usize = @intCast(@max(data.numSamples, 0));
+        const synth = &p.engine.synth;
 
-        var channels: []const [*c]f32 = &.{};
+        var channels: []const [*]f32 = &.{};
         if (data.numOutputs > 0 and data.outputs != null and data.outputs[0].numChannels > 0) {
             const bus = &data.outputs[0];
             const bufs = bus.unnamed_0.Steinberg_Vst_AudioBusBuffers_channelBuffers32;
-            if (bufs != null) channels = bufs[0..@intCast(bus.numChannels)];
+            if (bufs != null) channels = @ptrCast(bufs[0..@intCast(bus.numChannels)]);
             bus.silenceFlags = 0;
         }
 
@@ -259,7 +234,7 @@ const Plugin = struct {
                 if (events.*.lpVtbl.*.getEvent.?(events, i, &e) != ok) continue;
                 const at: usize = @min(@as(usize, @intCast(@max(e.sampleOffset, 0))), frames);
                 if (at > pos) {
-                    p.renderInto(table, channels, pos, at);
+                    p.engine.render(channels, pos, at);
                     pos = at;
                 }
                 switch (e.type) {
@@ -267,58 +242,29 @@ const Plugin = struct {
                         const on = e.unnamed_0.Steinberg_Vst_Event_noteOn;
                         // A note-on with zero velocity is a note-off by MIDI convention.
                         if (on.velocity <= 0) {
-                            p.synth.noteOff(on.pitch, on.noteId);
+                            synth.noteOff(on.pitch, on.noteId);
                         } else {
-                            p.synth.noteOn(on.pitch, on.tuning, on.velocity, on.noteId);
+                            synth.noteOn(on.pitch, on.tuning, on.velocity, on.noteId);
                         }
                     },
                     c.Steinberg_Vst_Event_EventTypes_kNoteOffEvent => {
                         const off = e.unnamed_0.Steinberg_Vst_Event_noteOff;
-                        p.synth.noteOff(off.pitch, off.noteId);
+                        synth.noteOff(off.pitch, off.noteId);
                     },
                     else => {},
                 }
             }
         }
-        p.renderInto(table, channels, pos, frames);
-    }
-
-    fn renderInto(p: *Plugin, table: *const wt.Table, channels: []const [*c]f32, from: usize, to: usize) void {
-        if (to <= from) return;
-        if (channels.len == 0) {
-            // No output buffers (e.g. a parameter flush): keep voices advancing.
-            var scratch: [256]f32 = undefined;
-            var at = from;
-            while (at < to) {
-                const n = @min(scratch.len, to - at);
-                p.synth.render(table, scratch[0..n]);
-                at += n;
-            }
-            return;
-        }
-        const first = channels[0][from..to];
-        p.synth.render(table, first);
-        for (channels[1..]) |ch| @memcpy(ch[from..to], first);
+        p.engine.render(channels, pos, frames);
     }
 };
 
-// Plugin state format: "MSY1", then formula, from and to, each as a u8
-// length followed by UTF-8 bytes.
-const state_magic = "MSY1";
-
 fn writeState(stream: [*c]c.struct_Steinberg_IBStream, settings: *const wt.Settings) tresult {
-    var buf: [4 + 3 + wt.max_formula_len + 2 * wt.max_range_len]u8 = undefined;
-    @memcpy(buf[0..4], state_magic);
-    var n: usize = 4;
-    for (std.enums.values(wt.Field)) |field| {
-        const s = settings.get(field);
-        buf[n] = @intCast(s.len);
-        @memcpy(buf[n + 1 ..][0..s.len], s);
-        n += 1 + s.len;
-    }
+    var buf: [engine.max_state_len]u8 = undefined;
+    const data = engine.serialize(settings, &buf);
     var written: i32 = 0;
-    const r = stream.*.lpVtbl.*.write.?(stream, &buf, @intCast(n), &written);
-    return if (r == ok and written == n) ok else false_result;
+    const r = stream.*.lpVtbl.*.write.?(stream, @constCast(data.ptr), @intCast(data.len), &written);
+    return if (r == ok and written == data.len) ok else false_result;
 }
 
 fn readState(stream: [*c]c.struct_Steinberg_IBStream) ?wt.Settings {
@@ -330,18 +276,7 @@ fn readState(stream: [*c]c.struct_Steinberg_IBStream) ?wt.Settings {
         if (r != ok or got <= 0) break;
         total += @intCast(got);
     }
-    const data = buf[0..total];
-    if (data.len < 4 or !std.mem.eql(u8, data[0..4], state_magic)) return null;
-    var settings: wt.Settings = .{};
-    var n: usize = 4;
-    for (std.enums.values(wt.Field)) |field| {
-        if (n >= data.len) return null;
-        const len = data[n];
-        if (len > wt.Settings.maxLen(field) or n + 1 + len > data.len) return null;
-        settings.set(field, data[n + 1 ..][0..len]);
-        n += 1 + len;
-    }
-    return settings;
+    return engine.deserialize(buf[0..total]);
 }
 
 // IComponent ------------------------------------------------------------------
@@ -422,7 +357,7 @@ fn activateBus(_: ?*anyopaque, _: c.Steinberg_Vst_MediaType, _: c.Steinberg_Vst_
 }
 
 fn setActive(this: ?*anyopaque, state: c.Steinberg_TBool) callconv(.c) tresult {
-    if (state == 0) Plugin.fromIface("component", this).synth.reset();
+    if (state == 0) Plugin.fromIface("component", this).engine.synth.reset();
     return ok;
 }
 
@@ -430,9 +365,7 @@ fn componentSetState(this: ?*anyopaque, stream: [*c]c.struct_Steinberg_IBStream)
     if (stream == null) return invalid_argument;
     const p = Plugin.fromIface("component", this);
     const settings = readState(stream) orelse return false_result;
-    var table: wt.Table = undefined;
-    if (wt.build(&settings, &table) != .ok) return false_result;
-    p.apply(&settings, &table);
+    if (!p.engine.load(&settings)) return false_result;
     // VST3 calls setState on the UI thread, so the editor can be updated here.
     if (p.editor) |e| e.load(&settings);
     return ok;
@@ -441,9 +374,7 @@ fn componentSetState(this: ?*anyopaque, stream: [*c]c.struct_Steinberg_IBStream)
 fn componentGetState(this: ?*anyopaque, stream: [*c]c.struct_Steinberg_IBStream) callconv(.c) tresult {
     if (stream == null) return invalid_argument;
     const p = Plugin.fromIface("component", this);
-    p.lockSettings();
-    const settings = p.settings;
-    p.unlockSettings();
+    const settings = p.engine.currentSettings();
     return writeState(stream, &settings);
 }
 
@@ -497,12 +428,12 @@ fn getLatencySamples(_: ?*anyopaque) callconv(.c) u32 {
 fn setupProcessing(this: ?*anyopaque, setup: [*c]c.struct_Steinberg_Vst_ProcessSetup) callconv(.c) tresult {
     if (setup == null or setup.*.sampleRate <= 0) return invalid_argument;
     if (setup.*.symbolicSampleSize != c.Steinberg_Vst_SymbolicSampleSizes_kSample32) return false_result;
-    Plugin.fromIface("processor", this).synth.setSampleRate(setup.*.sampleRate);
+    Plugin.fromIface("processor", this).engine.synth.setSampleRate(setup.*.sampleRate);
     return ok;
 }
 
 fn setProcessing(this: ?*anyopaque, state: c.Steinberg_TBool) callconv(.c) tresult {
-    if (state == 0) Plugin.fromIface("processor", this).synth.allNotesOff();
+    if (state == 0) Plugin.fromIface("processor", this).engine.synth.allNotesOff();
     return ok;
 }
 
@@ -515,7 +446,7 @@ fn processAudio(this: ?*anyopaque, data: [*c]c.struct_Steinberg_Vst_ProcessData)
 
 fn getTailSamples(this: ?*anyopaque) callconv(.c) u32 {
     const p = Plugin.fromIface("processor", this);
-    return @intFromFloat(@ceil(p.synth.sample_rate * 0.1));
+    return @intFromFloat(@ceil(p.engine.synth.sample_rate * engine.tail_seconds));
 }
 
 // IEditController -------------------------------------------------------------
@@ -684,9 +615,7 @@ fn viewAttached(this: ?*anyopaque, parent: ?*anyopaque, platform: c.Steinberg_FI
     const v = View.from(this);
     v.detach();
     const p = v.plugin;
-    p.lockSettings();
-    const settings = p.settings;
-    p.unlockSettings();
+    const settings = p.engine.currentSettings();
     p.editor = gui.Editor.create(allocator, parent, .{ .ctx = p, .apply = Plugin.applyFromEditor }, &settings) catch return false_result;
     return ok;
 }
@@ -745,41 +674,6 @@ test {
     _ = @import("expr.zig");
     _ = @import("wavetable.zig");
     _ = @import("synth.zig");
+    _ = @import("engine.zig");
     _ = @import("gui/editor.zig");
-}
-
-test "state round trip" {
-    const MemStream = struct {
-        iface: c.struct_Steinberg_IBStream = .{ .lpVtbl = &vtbl },
-        buf: [1024]u8 = undefined,
-        len: usize = 0,
-        pos: usize = 0,
-
-        var vtbl: c.struct_Steinberg_IBStreamVtbl = .{ .read = read, .write = write };
-
-        fn self(this: ?*anyopaque) *@This() {
-            return @fieldParentPtr("iface", @as(*c.struct_Steinberg_IBStream, @ptrCast(@alignCast(this.?))));
-        }
-        fn read(this: ?*anyopaque, buffer: ?*anyopaque, n: i32, got: [*c]i32) callconv(.c) tresult {
-            const s = self(this);
-            const k = @min(@as(usize, @intCast(n)), s.len - s.pos);
-            @memcpy(@as([*]u8, @ptrCast(buffer.?))[0..k], s.buf[s.pos..][0..k]);
-            s.pos += k;
-            got.* = @intCast(k);
-            return ok;
-        }
-        fn write(this: ?*anyopaque, buffer: ?*anyopaque, n: i32, put: [*c]i32) callconv(.c) tresult {
-            const s = self(this);
-            const k: usize = @intCast(n);
-            @memcpy(s.buf[s.len..][0..k], @as([*]const u8, @ptrCast(buffer.?))[0..k]);
-            s.len += k;
-            put.* = n;
-            return ok;
-        }
-    };
-    var stream: MemStream = .{};
-    const in = wt.Settings.init("sin(x) + 0.5sin(2x)", "-pi", "pi");
-    try std.testing.expectEqual(ok, writeState(&stream.iface, &in));
-    const out = readState(&stream.iface).?;
-    for (std.enums.values(wt.Field)) |f| try std.testing.expectEqualStrings(in.get(f), out.get(f));
 }

@@ -41,6 +41,12 @@ pub fn getClass(name: [*:0]const u8) Class {
     return objc_getClass(name);
 }
 
+extern fn objc_getProtocol(name: [*:0]const u8) ?*anyopaque;
+
+pub fn getProtocol(name: [*:0]const u8) ?*anyopaque {
+    return objc_getProtocol(name);
+}
+
 pub fn sel(name: [*:0]const u8) Sel {
     return sel_registerName(name);
 }
