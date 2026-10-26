@@ -1,8 +1,9 @@
-// Opens the installed MathSynth Audio Unit out of process, the way GarageBand
-// does, asks for its editor and reports what comes back. Optionally saves a
-// screenshot of the window.
+// Opens an installed Audio Unit out of process, the way GarageBand does,
+// asks for its editor and reports what comes back, or renders a note. The
+// component is identified from a bundle's Info.plist (e.g. the build output).
 //
-//   au-oop [out.png]
+//   au-oop <bundle.component> [out.png]
+//   au-oop <bundle.component> render <sample rate>
 
 #import <AppKit/AppKit.h>
 #import <AudioToolbox/AudioToolbox.h>
@@ -15,6 +16,20 @@ static void spin(BOOL *done, double seconds) {
     }
 }
 
+static AudioComponentDescription descFromBundle(const char *path) {
+    NSBundle *bundle = [NSBundle bundleWithPath:[NSString stringWithUTF8String:path]];
+    NSDictionary *info = [bundle.infoDictionary[@"AudioComponents"] firstObject];
+    if (!info) {
+        fprintf(stderr, "%s: no AudioComponents in Info.plist\n", path);
+        exit(1);
+    }
+    AudioComponentDescription d = {0};
+    d.componentType = NSHFSTypeCodeFromFileType([NSString stringWithFormat:@"'%@'", info[@"type"]]);
+    d.componentSubType = NSHFSTypeCodeFromFileType([NSString stringWithFormat:@"'%@'", info[@"subtype"]]);
+    d.componentManufacturer = NSHFSTypeCodeFromFileType([NSString stringWithFormat:@"'%@'", info[@"manufacturer"]]);
+    return d;
+}
+
 static void dump(NSView *v, int depth) {
     printf("%*s%s frame=%s\n", depth * 2, "", [NSStringFromClass([v class]) UTF8String],
            [NSStringFromRect(v.frame) UTF8String]);
@@ -23,8 +38,7 @@ static void dump(NSView *v, int depth) {
 
 // Renders A4 through the out-of-process unit with AVAudioEngine's offline
 // mode at `rate` and reports level and pitch (from zero crossings).
-static int renderTest(double rate) {
-    AudioComponentDescription desc = {'aumu', 'MSyn', 'Mthx', 0, 0};
+static int renderTest(AudioComponentDescription desc, double rate) {
     __block AVAudioUnit *node = nil;
     __block BOOL done = NO;
     [AVAudioUnit instantiateWithComponentDescription:desc
@@ -92,16 +106,22 @@ static int renderTest(double rate) {
 }
 
 int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: au-oop <bundle.component> [out.png] | render <rate>\n");
+        return 1;
+    }
+    AudioComponentDescription desc = descFromBundle(argv[1]);
+    argc--;
+    argv++;
     if (argc > 2 && strcmp(argv[1], "render") == 0) {
         @autoreleasepool {
-            return renderTest(atof(argv[2]));
+            return renderTest(desc, atof(argv[2]));
         }
     }
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
-        AudioComponentDescription desc = {'aumu', 'MSyn', 'Mthx', 0, 0};
         __block AUAudioUnit *unit = nil;
         __block BOOL done = NO;
         [AUAudioUnit instantiateWithComponentDescription:desc

@@ -1,6 +1,7 @@
 //! Polyphonic wavetable oscillator bank with a linear ADSR envelope.
 
 const std = @import("std");
+const adsr = @import("common").adsr;
 const wavetable = @import("wavetable.zig");
 const blend = @import("blend.zig");
 const Mode = @import("params.zig").Mode;
@@ -9,33 +10,15 @@ pub const max_voices = 16;
 
 /// Headroom so a handful of full-scale voices don't clip.
 const output_gain = 0.25;
-/// Attack, decay and release never go below this, so even "0 ms" doesn't
-/// click.
-const min_segment_seconds = 0.001;
-
-/// Envelope settings in user units.
-pub const Envelope = struct {
-    attack_ms: f32 = 5,
-    decay_ms: f32 = 250,
-    /// 0..1
-    sustain: f32 = 0.7,
-    release_ms: f32 = 300,
-};
-
-const Stage = enum { attack, decay, sustain, release };
 
 const Voice = struct {
     active: bool = false,
-    stage: Stage = .attack,
     pitch: i16 = 0,
     note_id: i32 = -1,
     phase: f64 = 0,
     phase_inc: f64 = 0,
     velocity: f32 = 0,
-    env: f32 = 0,
-    /// Per-sample decrement during release, fixed at note-off so the release
-    /// time holds from whatever level the note was at.
-    release_step: f32 = 0,
+    env: adsr.Envelope = .{},
     /// Order in which voices were started, used to steal the oldest.
     age: u64 = 0,
 };
@@ -43,10 +26,8 @@ const Voice = struct {
 pub const Synth = struct {
     voices: [max_voices]Voice = @splat(.{}),
     sample_rate: f64 = 44100,
-    envelope: Envelope = .{},
-    attack_step: f32 = 0,
-    decay_step: f32 = 0,
-    release_samples: f32 = 1,
+    envelope: adsr.Settings = .{},
+    shape: adsr.Shape = .{},
     counter: u64 = 0,
 
     pub fn setSampleRate(s: *Synth, rate: f64) void {
@@ -55,17 +36,9 @@ pub const Synth = struct {
     }
 
     /// Cheap enough to call once per audio block.
-    pub fn setEnvelope(s: *Synth, e: Envelope) void {
+    pub fn setEnvelope(s: *Synth, e: adsr.Settings) void {
         s.envelope = e;
-        s.envelope.sustain = std.math.clamp(e.sustain, 0, 1);
-        s.attack_step = 1.0 / s.segmentSamples(e.attack_ms);
-        s.decay_step = (1.0 - s.envelope.sustain) / s.segmentSamples(e.decay_ms);
-        s.release_samples = s.segmentSamples(e.release_ms);
-    }
-
-    fn segmentSamples(s: *const Synth, ms: f32) f32 {
-        const seconds = @max(@as(f64, ms) / 1000.0, min_segment_seconds);
-        return @floatCast(seconds * s.sample_rate);
+        s.shape = adsr.Shape.init(e, s.sample_rate);
     }
 
     pub fn reset(s: *Synth) void {
@@ -77,38 +50,34 @@ pub const Synth = struct {
         const semis = @as(f64, @floatFromInt(pitch)) - 69.0 + @as(f64, tuning_cents) / 100.0;
         const freq = 440.0 * std.math.pow(f64, 2.0, semis / 12.0);
         s.counter += 1;
+        // Retriggering a stolen voice ramps from its current level instead
+        // of jumping, which avoids clicks.
+        var env: adsr.Envelope = if (v.active) v.env else .{};
+        env.trigger();
         v.* = .{
             .active = true,
-            .stage = .attack,
             .pitch = pitch,
             .note_id = note_id,
             .phase = 0,
             .phase_inc = freq / s.sample_rate,
             .velocity = velocity,
-            // Retriggering a stolen voice ramps from its current level
-            // instead of jumping, which avoids clicks.
-            .env = if (v.active) v.env else 0,
+            .env = env,
             .age = s.counter,
         };
     }
 
     pub fn noteOff(s: *Synth, pitch: i16, note_id: i32) void {
         for (&s.voices) |*v| {
-            if (!v.active or v.stage == .release) continue;
+            if (!v.active or v.env.releasing()) continue;
             const matches = if (note_id != -1 and v.note_id != -1) v.note_id == note_id else v.pitch == pitch;
-            if (matches) s.release(v);
+            if (matches) v.env.release(&s.shape);
         }
     }
 
     pub fn allNotesOff(s: *Synth) void {
         for (&s.voices) |*v| {
-            if (v.active and v.stage != .release) s.release(v);
+            if (v.active and !v.env.releasing()) v.env.release(&s.shape);
         }
-    }
-
-    fn release(s: *Synth, v: *Voice) void {
-        v.stage = .release;
-        v.release_step = @max(v.env, 1e-4) / s.release_samples;
     }
 
     fn pickVoice(s: *Synth) *Voice {
@@ -116,44 +85,12 @@ pub const Synth = struct {
         for (&s.voices) |*v| {
             if (!v.active) return v;
             // Prefer stealing voices that are already fading out.
-            const v_rel = v.stage == .release;
-            const o_rel = oldest.stage == .release;
+            const v_rel = v.env.releasing();
+            const o_rel = oldest.env.releasing();
             const better = (v_rel and !o_rel) or (v_rel == o_rel and v.age < oldest.age);
             if (better) oldest = v;
         }
         return oldest;
-    }
-
-    /// Advances the envelope by one sample. Returns false when the voice has
-    /// finished.
-    fn stepEnvelope(s: *const Synth, v: *Voice) bool {
-        switch (v.stage) {
-            .attack => {
-                v.env += s.attack_step;
-                if (v.env >= 1) {
-                    v.env = 1;
-                    v.stage = .decay;
-                }
-            },
-            .decay => {
-                v.env -= s.decay_step;
-                if (v.env <= s.envelope.sustain) {
-                    v.env = s.envelope.sustain;
-                    v.stage = .sustain;
-                }
-            },
-            // Glide (~5 ms) to the sustain level so moving it while a note
-            // is held doesn't click.
-            .sustain => v.env += (s.envelope.sustain - v.env) * 0.005,
-            .release => {
-                v.env -= v.release_step;
-                if (v.env <= 0) {
-                    v.env = 0;
-                    return false;
-                }
-            },
-        }
-        return true;
     }
 
     /// Writes `out.len` samples of output to `out` (mono; caller copies to
@@ -167,12 +104,12 @@ pub const Synth = struct {
             if (!v.active) continue;
             var mix = mix_from;
             for (out) |*sample| {
-                if (!s.stepEnvelope(v)) {
+                if (!v.env.step(&s.shape)) {
                     v.active = false;
                     break;
                 }
                 const value = blend.sample(mode, tables, v.phase, mix);
-                sample.* += value * v.env * v.velocity * output_gain;
+                sample.* += value * v.env.level * v.velocity * output_gain;
                 v.phase += v.phase_inc;
                 v.phase -= @floor(v.phase);
                 mix += mix_step;
@@ -180,53 +117,6 @@ pub const Synth = struct {
         }
     }
 };
-
-fn testSynth(e: Envelope) Synth {
-    var s: Synth = .{};
-    s.setSampleRate(1000); // 1 sample = 1 ms keeps the numbers readable
-    s.setEnvelope(e);
-    return s;
-}
-
-fn envAfter(s: *Synth, samples: usize) f32 {
-    var v = &s.voices[0];
-    for (0..samples) |_| {
-        if (!s.stepEnvelope(v)) {
-            v.active = false;
-            break;
-        }
-    }
-    return v.env;
-}
-
-test "adsr shape" {
-    var s = testSynth(.{ .attack_ms = 10, .decay_ms = 20, .sustain = 0.5, .release_ms = 40 });
-    s.noteOn(60, 0, 1, -1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), envAfter(&s, 5), 1e-5); // halfway up
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), envAfter(&s, 5), 1e-5); // peak
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), envAfter(&s, 10), 1e-5); // halfway down
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), envAfter(&s, 10), 1e-5); // sustain
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), envAfter(&s, 100), 1e-5); // held
-    s.noteOff(60, -1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), envAfter(&s, 20), 1e-5); // halfway out
-    _ = envAfter(&s, 25);
-    try std.testing.expect(!s.voices[0].active);
-}
-
-test "release during attack starts from the current level" {
-    var s = testSynth(.{ .attack_ms = 100, .decay_ms = 10, .sustain = 1, .release_ms = 10 });
-    s.noteOn(60, 0, 1, -1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.2), envAfter(&s, 20), 1e-5);
-    s.noteOff(60, -1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), envAfter(&s, 5), 1e-5);
-}
-
-test "zero times still ramp" {
-    var s = testSynth(.{ .attack_ms = 0, .decay_ms = 0, .sustain = 0.3, .release_ms = 0 });
-    s.noteOn(60, 0, 1, -1);
-    try std.testing.expectApproxEqAbs(@as(f32, 1), envAfter(&s, 1), 1e-5); // 1 ms minimum = 1 sample here
-    try std.testing.expectApproxEqAbs(@as(f32, 0.3), envAfter(&s, 1), 1e-5);
-}
 
 test "note plays and releases to silence" {
     var t: wavetable.Table = undefined;

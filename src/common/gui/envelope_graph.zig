@@ -7,7 +7,6 @@
 //! under the cursor, and refits afterwards.
 
 const std = @import("std");
-const params = @import("../params.zig");
 
 pub const Point = struct { x: f64, y: f64 };
 
@@ -22,12 +21,13 @@ pub const Values = struct {
 /// `sustain` sets sustain, `end` sets release.
 pub const Handle = enum { peak, decay, sustain, end };
 
-pub fn affected(h: Handle) []const params.Id {
+/// Which of the four values dragging a handle can change.
+pub fn changes(h: Handle) struct { attack: bool = false, decay: bool = false, sustain: bool = false, release: bool = false } {
     return switch (h) {
-        .peak => &.{.attack},
-        .decay => &.{ .decay, .sustain },
-        .sustain => &.{.sustain},
-        .end => &.{.release},
+        .peak => .{ .attack = true },
+        .decay => .{ .decay = true, .sustain = true },
+        .sustain => .{ .sustain = true },
+        .end => .{ .release = true },
     };
 }
 
@@ -39,6 +39,8 @@ pub const Layout = struct {
     h: f64,
     /// Milliseconds shown across the width, not counting the sustain hold.
     span_ms: f64,
+    /// Longest attack, decay or release a drag can set.
+    max_ms: f64 = 10_000,
 
     pub const pad = 14;
 
@@ -137,18 +139,18 @@ pub const Layout = struct {
         // Points can't be dragged past the right edge of the plot.
         const right = l.x + l.w;
         const time = struct {
-            fn at(layout: Layout, id: params.Id, dx: f64) f32 {
-                return params.info(id).clamp(@floatCast(layout.pxToMs(@max(dx, 0))));
+            fn at(layout: Layout, dx: f64) f32 {
+                return @floatCast(std.math.clamp(layout.pxToMs(dx), 0, layout.max_ms));
             }
         }.at;
         switch (h) {
-            .peak => out.attack_ms = time(l, .attack, @min(p.x, right - (pts[4].x - pts[1].x)) - pts[0].x),
+            .peak => out.attack_ms = time(l, @min(p.x, right - (pts[4].x - pts[1].x)) - pts[0].x),
             .decay => {
-                out.decay_ms = time(l, .decay, @min(p.x, right - (pts[4].x - pts[2].x)) - pts[1].x);
+                out.decay_ms = time(l, @min(p.x, right - (pts[4].x - pts[2].x)) - pts[1].x);
                 out.sustain_pct = sustain;
             },
             .sustain => out.sustain_pct = sustain,
-            .end => out.release_ms = time(l, .release, @min(p.x, right) - pts[3].x),
+            .end => out.release_ms = time(l, @min(p.x, right) - pts[3].x),
         }
         return out;
     }

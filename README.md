@@ -105,14 +105,16 @@ You need Zig 0.16 and macOS. The editor uses Cocoa.
 zig build -Doptimize=ReleaseFast
 ```
 
-This produces `zig-out/MathSynth.vst3` and `zig-out/MathSynth.component`. To
-sign both ad hoc and copy them into `~/Library/Audio/Plug-Ins`:
+This produces `zig-out/MathSynth.vst3` and `zig-out/MathSynth.component` (and
+the same for every other plugin in the repository). To sign them ad hoc and
+copy them into `~/Library/Audio/Plug-Ins`:
 
 ```bash
 zig build install-plugin -Doptimize=ReleaseFast
 ```
 
-Use `install-vst3` or `install-au` to install just one of them.
+Use `install-vst3` or `install-au` for one format, or `install-mathsynth` for
+just this plugin.
 
 To run the unit tests:
 
@@ -193,32 +195,65 @@ unit with AVAudioEngine and reports its level and measured pitch.
 
 ## Layout
 
+The repository holds plugins that share one set of building blocks:
+`src/common` has everything reusable, and each plugin has its own folder.
+MathSynth is the first.
+
 | Path | Contents |
 |---|---|
-| `src/expr.zig` | Tokenizer, recursive-descent parser and stack-machine evaluator, with error positions |
-| `src/wavetable.zig` | Input validation, table building, lock-free triple buffer to the audio thread |
-| `src/params.zig` | Gain and ADSR parameters: ranges, defaults, normalized mapping, text formatting and parsing |
-| `src/synth.zig` | 16-voice wavetable oscillator with a linear ADSR envelope |
-| `src/blend.zig` | How the two waves combine (sum, FM, ring), shared by the synth and the plot |
-| `src/engine.zig` | Format-independent core: synth, table handoff, parameters, gain, saved state |
-| `src/plugin.zig` | VST3 factory, component/processor/controller, plug view |
-| `src/au.zig` | Audio Unit v2 music device: properties, MIDI queue, render, view factory glue |
-| `src/au_view.m` | The AU view factory class (Objective-C, because AU hosts look it up by name in the bundle) |
-| `src/gui/objc.zig` | Thin Objective-C runtime and CoreGraphics bindings |
-| `src/gui/editor.zig` | The Cocoa editor, shared by both formats |
-| `src/gui/envelope_graph.zig` | Geometry of the envelope graph: point positions, hit testing, drag mapping |
+| `src/common/plugin.zig` | The contract a plugin implements, and the editor host API |
+| `src/common/vst3.zig` | `Wrapper(P)`: any plugin as a VST3 (factory, component/processor/controller, plug view) |
+| `src/common/au.zig` | `Wrapper(P)`: any plugin as an Audio Unit v2 (properties, MIDI queue, render, view glue) |
+| `src/common/au_view.m` | The AU view factory class, compiled per plugin with its class names |
+| `src/common/meta.zig` | Plugin identity (names, IDs, versions) and Info.plist generation |
+| `src/common/param.zig` | Parameter descriptions, normalized mapping, formatting/parsing, lock-free value store |
+| `src/common/adsr.zig` | Linear ADSR envelope |
+| `src/common/triple_buffer.zig` | Lock-free handoff of large values from the UI to the audio thread |
+| `src/common/expr.zig` | The formula language: tokenizer, parser, stack-machine evaluator |
+| `src/common/gui/objc.zig` | Objective-C runtime and CoreGraphics bindings |
+| `src/common/gui/widgets.zig` | Knob and slider drawing |
+| `src/common/gui/envelope_graph.zig` | Geometry of an interactive ADSR graph |
+| `src/mathsynth/meta.zig` | MathSynth's names and IDs |
+| `src/mathsynth/plugin.zig` | MathSynth described for the wrappers |
+| `src/mathsynth/vst3.zig`, `au.zig` | Entry points: one line each, exporting the wrappers |
+| `src/mathsynth/engine.zig` | The plugin instance: synth, table handoff, parameters, gain, saved state |
+| `src/mathsynth/params.zig` | Its parameters (gain, ADSR, mix, mode) |
+| `src/mathsynth/synth.zig` | 16-voice wavetable oscillator |
+| `src/mathsynth/wavetable.zig` | Formula validation and table building |
+| `src/mathsynth/blend.zig` | How the two waves combine (sum, FM, ring), shared by the synth and the plot |
+| `src/mathsynth/editor.zig` | The Cocoa editor |
+| `tools/` | Test hosts (`host.zig`, `au_host.zig`, `au_oop.m`) |
 | `vendor/vst3_c_api` | Steinberg's VST3 C API header (BSD-3 licence), translated with `translate-c` at build time |
 
-The VST3 is a single component: one object implements `IComponent`,
-`IAudioProcessor` and `IEditController`, so the editor and the audio engine
-share state directly. Both formats save both waves' formula, from and to
-strings and all parameters in the plugin state (the AU puts them in
-`ClassInfo`), so projects and presets reopen with the same sound. Projects
-saved by earlier versions still load; the second wave then starts as the
-default square at 0 % mix.
+The VST3 wrapper makes a single component: one object implements
+`IComponent`, `IAudioProcessor` and `IEditController`, so the editor and the
+audio engine share state directly. The plugin's state bytes are saved by
+both formats (the AU puts them in `ClassInfo`).
 
-The Audio Unit is identified as type `aumu`, subtype `MSyn`, manufacturer
-`Mthx`.
+MathSynth saves both waves' formula, from and to strings and all parameters,
+so projects and presets reopen with the same sound. Projects saved by earlier
+versions still load; the second wave then starts as the default square at
+0 % mix. Its Audio Unit is type `aumu`, subtype `MSyn`, manufacturer `Mthx`.
+
+## Adding a plugin
+
+1. Create `src/<name>/` with:
+   - `meta.zig`: a `metadata(Metadata)` function returning the plugin's name,
+     version, kind, bundle ID prefix, a new VST3 class ID (four random 32-bit
+     words, e.g. from `uuidgen`) and AU codes. The AU manufacturer code needs
+     at least one capital letter.
+   - `plugin.zig`: `meta`, `params` (a list of `common.param.Info`), an
+     `Instance` type and optionally an `Editor` type. `src/common/plugin.zig`
+     lists exactly what they must provide, and the build tells you what's
+     missing.
+   - `vst3.zig` and `au.zig`: copy MathSynth's. They only export the wrappers.
+2. Add it to the `plugins` list at the top of `build.zig`.
+3. `zig build install-<name>` builds, signs and installs both formats.
+   `zig build host -Dplugin=<name> -- info` and the other test-host steps
+   work with `-Dplugin` too.
+
+The wrappers currently support instruments (MIDI in, stereo out). Effects
+need an audio input bus in both wrappers, which hasn't been added yet.
 
 ## Current limits
 

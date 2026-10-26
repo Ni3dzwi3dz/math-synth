@@ -1,8 +1,8 @@
-//! Turns the user's formula and range into a single-cycle wavetable, and
-//! hands finished tables to the audio thread without locks.
+//! Turns the user's formula and range into a single-cycle wavetable.
 
 const std = @import("std");
-const expr = @import("expr.zig");
+const common = @import("common");
+const expr = common.expr;
 
 pub const size = 2048;
 pub const Table = [size]f32;
@@ -139,52 +139,8 @@ fn evalConstant(text: []const u8, diag: *expr.Diagnostic) ?f64 {
     return v;
 }
 
-/// Single-producer / single-consumer triple buffer. The UI thread writes new
-/// tables, the audio thread picks up the most recent one at the start of each
-/// block. Neither side ever blocks.
-pub const TripleBuffer = struct {
-    tables: [3]Table = undefined,
-    /// Index of the slot in the middle, plus `dirty_bit` when it holds a
-    /// table the reader has not seen yet.
-    shared: std.atomic.Value(u8) = .init(1),
-    back: u8 = 2, // owned by the writer
-    front: u8 = 0, // owned by the reader
-    writer_lock: std.atomic.Value(bool) = .init(false),
-
-    const dirty_bit: u8 = 4;
-
-    pub fn initWith(tb: *TripleBuffer, table: *const Table) void {
-        for (&tb.tables) |*t| t.* = table.*;
-    }
-
-    /// Exclusive access to the back buffer. Call `publish` or `cancelWrite`
-    /// afterwards. Writers on different threads serialise here.
-    pub fn beginWrite(tb: *TripleBuffer) *Table {
-        while (tb.writer_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
-        return &tb.tables[tb.back];
-    }
-
-    pub fn publish(tb: *TripleBuffer) void {
-        const prev = tb.shared.swap(tb.back | dirty_bit, .acq_rel);
-        tb.back = prev & ~dirty_bit;
-        tb.writer_lock.store(false, .release);
-    }
-
-    pub fn cancelWrite(tb: *TripleBuffer) void {
-        tb.writer_lock.store(false, .release);
-    }
-
-    /// Audio thread: returns the newest published table.
-    pub fn read(tb: *TripleBuffer) *const Table {
-        if (tb.shared.load(.monotonic) & dirty_bit != 0) {
-            const prev = tb.shared.swap(tb.front, .acq_rel);
-            tb.front = prev & ~dirty_bit;
-        }
-        return &tb.tables[tb.front];
-    }
-};
+/// Hands finished tables to the audio thread without locks.
+pub const TripleBuffer = common.TripleBuffer(Table);
 
 test "build sine table" {
     var t: Table = undefined;
@@ -228,17 +184,4 @@ test "settings truncate without splitting utf-8" {
     long[63] = 0xA9;
     s.set(.from, &long);
     try std.testing.expectEqual(@as(usize, 62), s.get(.from).len);
-}
-
-test "triple buffer hands over the latest table" {
-    var tb: TripleBuffer = .{};
-    var zero: Table = @splat(0);
-    tb.initWith(&zero);
-    try std.testing.expectEqual(@as(f32, 0), tb.read()[0]);
-    tb.beginWrite()[0] = 1;
-    tb.publish();
-    tb.beginWrite()[0] = 2;
-    tb.publish();
-    try std.testing.expectEqual(@as(f32, 2), tb.read()[0]);
-    try std.testing.expectEqual(@as(f32, 2), tb.read()[0]);
 }

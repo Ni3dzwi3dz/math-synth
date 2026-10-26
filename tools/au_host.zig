@@ -1,4 +1,4 @@
-//! Tiny Audio Unit host for smoke-testing MathSynth.component.
+//! Tiny Audio Unit host for smoke-testing a plugin's .component bundle.
 //!
 //!   au-host <bundle.component> info
 //!   au-host <bundle.component> render <out.wav> [formula from to]
@@ -102,17 +102,45 @@ fn cfStr(s: [*:0]const u8) CFTypeRef {
     return CFStringCreateWithCString(null, s, 0x08000100);
 }
 
+fn plistString(dict: Id, key: [:0]const u8) []const u8 {
+    const v = msg(Id, dict, "objectForKey:", .{objc.nsString(key)});
+    if (v == null) fail("Info.plist has no {s}", .{key});
+    return objc.utf8(v);
+}
+
+fn code(text: []const u8) u32 {
+    if (text.len != 4) fail("expected a four-character code, got \"{s}\"", .{text});
+    return std.mem.readInt(u32, text[0..4], .big);
+}
+
 fn open(bundle: []const u8) AudioUnit {
     var buf: [1024]u8 = undefined;
     const ns_bundle = objc.classMsg(Id, "NSBundle", "bundleWithPath:", .{objc.nsString(bundle)});
     if (ns_bundle == null or !msg(bool, ns_bundle, "load", .{})) fail("could not load bundle {s}", .{bundle});
-    const bin = std.fmt.bufPrintZ(&buf, "{s}/Contents/MacOS/MathSynth", .{bundle}) catch fail("path too long", .{});
-    const handle = dlopen(bin, 2) orelse fail("dlopen: {s}", .{dlerror() orelse "?"});
-    const factory = dlsym(handle, "MathSynthAUFactory") orelse fail("no MathSynthAUFactory export", .{});
 
-    // A test subtype, so an installed copy of the plugin can't be picked instead.
-    const desc: Desc = .{ .componentType = fourCC("aumu"), .componentSubType = fourCC("MSyT"), .componentManufacturer = fourCC("Mthx") };
-    const component = AudioComponentRegister(&desc, cfStr("MathSynth: MathSynth (test)"), 256, factory) orelse fail("AudioComponentRegister failed", .{});
+    // Everything about the component comes from its Info.plist.
+    const info = msg(Id, ns_bundle, "infoDictionary", .{});
+    const components = msg(Id, info, "objectForKey:", .{objc.nsString("AudioComponents")});
+    if (components == null) fail("{s} has no AudioComponents in Info.plist", .{bundle});
+    const component_info = msg(Id, components, "firstObject", .{});
+    const executable = plistString(info, "CFBundleExecutable");
+    const factory_name = plistString(component_info, "factoryFunction");
+
+    const bin = std.fmt.bufPrintZ(&buf, "{s}/Contents/MacOS/{s}", .{ bundle, executable }) catch fail("path too long", .{});
+    const handle = dlopen(bin, 2) orelse fail("dlopen: {s}", .{dlerror() orelse "?"});
+    var name_buf: [128]u8 = undefined;
+    const factory_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{factory_name}) catch fail("factory name too long", .{});
+    const factory = dlsym(handle, factory_z) orelse fail("no {s} export", .{factory_name});
+
+    const desc: Desc = .{
+        .componentType = code(plistString(component_info, "type")),
+        .componentSubType = code(plistString(component_info, "subtype")),
+        .componentManufacturer = code(plistString(component_info, "manufacturer")),
+    };
+    // Registered in this process only; the instance below is made from this
+    // registration, never from an installed copy.
+    const reg_name = std.fmt.bufPrintZ(&name_buf, "{s} (test)", .{plistString(component_info, "name")}) catch fail("name too long", .{});
+    const component = AudioComponentRegister(&desc, cfStr(reg_name), 0, factory) orelse fail("AudioComponentRegister failed", .{});
     var unit: AudioUnit = null;
     check(AudioComponentInstanceNew(component, &unit), "AudioComponentInstanceNew");
 
@@ -137,9 +165,13 @@ fn getClassInfo(unit: AudioUnit) CFTypeRef {
     return dict;
 }
 
-/// Prints a saved state ("MSY1".."MSY3"): each wave's strings, then the
-/// parameters.
+/// Prints a saved state. MathSynth's ("MSY1".."MSY3") is decoded: each
+/// wave's strings, then the parameters.
 fn printStateBytes(bytes: []const u8) void {
+    if (bytes.len < 4 or !std.mem.eql(u8, bytes[0..3], "MSY")) {
+        std.debug.print("plugin state: {d} bytes\n", .{bytes.len});
+        return;
+    }
     const version = bytes[3];
     const waves: usize = if (version >= '3') 2 else 1;
     var pos: usize = 4;
@@ -401,8 +433,8 @@ fn interact(unit: AudioUnit) void {
     // 50 px down: 0 dB -> -18 dB.
     const window_number = msg(isize, ov.window, "windowNumber", .{});
     const steps = [_]struct { [*:0]const u8, usize, f64 }{
-        .{ "mouseDown:", 1, 50 }, .{ "mouseDragged:", 6, 37.5 }, .{ "mouseDragged:", 6, 25 },
-        .{ "mouseDragged:", 6, 12.5 }, .{ "mouseDragged:", 6, 0 }, .{ "mouseUp:", 2, 0 },
+        .{ "mouseDown:", 1, 50 },      .{ "mouseDragged:", 6, 37.5 }, .{ "mouseDragged:", 6, 25 },
+        .{ "mouseDragged:", 6, 12.5 }, .{ "mouseDragged:", 6, 0 },    .{ "mouseUp:", 2, 0 },
     };
     for (steps) |step| {
         const in_window = msg(objc.NSPoint, knob, "convertPoint:toView:", .{ objc.NSPoint{ .x = 50, .y = step[2] }, @as(Id, null) });

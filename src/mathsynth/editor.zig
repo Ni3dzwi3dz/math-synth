@@ -5,11 +5,15 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const objc = @import("objc.zig");
-const wt = @import("../wavetable.zig");
-const params = @import("../params.zig");
-const graph = @import("envelope_graph.zig");
-const blend = @import("../blend.zig");
+const common = @import("common");
+const objc = common.objc;
+const graph = common.envelope_graph;
+const widgets = common.widgets;
+const wt = @import("wavetable.zig");
+const params = @import("params.zig");
+const blend = @import("blend.zig");
+const Engine = @import("engine.zig").Engine;
+const Host = common.plugin.EditorHost(Engine);
 
 const Id = objc.Id;
 const NSRect = objc.NSRect;
@@ -43,27 +47,11 @@ const wave_names = [wave_count][]const u8{ "f\u{2081}", "f\u{2082}" };
 
 const NSTextAlignmentRight: isize = if (builtin.cpu.arch == .x86_64) 1 else 2;
 
-/// What the editor needs from the plugin.
-pub const Model = struct {
-    ctx: *anyopaque,
-    /// Called with one wave's settings once they pass validation, and the
-    /// table built from them.
-    apply: *const fn (ctx: *anyopaque, wave: usize, settings: *const wt.Settings, table: *const wt.Table) void,
-    /// Current parameter value in plain units.
-    get_param: *const fn (ctx: *anyopaque, id: params.Id) f32,
-    /// A user edit of one parameter: `begin_edit`, any number of
-    /// `set_param`, then `end_edit` (hosts record this as one automation
-    /// gesture).
-    begin_edit: *const fn (ctx: *anyopaque, id: params.Id) void,
-    set_param: *const fn (ctx: *anyopaque, id: params.Id, plain: f32) void,
-    end_edit: *const fn (ctx: *anyopaque, id: params.Id) void,
-};
-
 const Classes = struct { root: objc.Class, wave: objc.Class, envelope: objc.Class, knob: objc.Class, slider: objc.Class };
 var classes: ?Classes = null;
 
 pub const Editor = struct {
-    model: Model,
+    host: Host,
     root: Id = null,
     /// Formula, from and to of each wave, indexed by wt.Field.
     fields: [wave_count][3]Id = @splat(@splat(null)),
@@ -93,10 +81,16 @@ pub const Editor = struct {
     env_span: f64 = 1000,
     knob_drag: ?struct { start_y: CGFloat, start: f64 } = null,
 
-    pub fn create(allocator: std.mem.Allocator, parent: Id, model: Model, settings: *const Waves) !*Editor {
+    // Plugin interface (common/plugin.zig) ---------------------------------------
+
+    pub const view_width = width;
+    pub const view_height = height;
+
+    pub fn create(allocator: std.mem.Allocator, parent: Id, host: Host) !*Editor {
         const cls = registerClasses() orelse return error.ObjcClassRegistration;
         const self = try allocator.create(Editor);
-        self.* = .{ .model = model };
+        self.* = .{ .host = host };
+        const settings = host.instance().?.currentSettings();
 
         const pool = objc.autoreleasePoolPush();
         defer objc.autoreleasePoolPop(pool);
@@ -204,7 +198,7 @@ pub const Editor = struct {
         self.place(help, NSRect.make(margin, height - 50, width - 2 * margin, 40), systemFont(11), secondaryColor());
 
         msg(void, parent, "addSubview:", .{root});
-        self.load(settings);
+        self.load(&settings);
 
         // Follows automation and host-side changes. Common modes keep it
         // running while the user drags.
@@ -232,9 +226,15 @@ pub const Editor = struct {
         allocator.destroy(self);
     }
 
-    /// Shows `waves` in the fields (e.g. after the host loaded a preset)
-    /// without pushing them back to the plugin.
-    pub fn load(self: *Editor, waves: *const Waves) void {
+    /// The host loaded a project or preset: show its formulas.
+    pub fn stateLoaded(self: *Editor) void {
+        const engine = self.host.instance() orelse return;
+        const settings = engine.currentSettings();
+        self.load(&settings);
+    }
+
+    /// Shows `waves` in the fields without pushing them back to the plugin.
+    fn load(self: *Editor, waves: *const Waves) void {
         const pool = objc.autoreleasePoolPush();
         defer objc.autoreleasePoolPop(pool);
         for (waves, 0..) |*settings, w| {
@@ -279,7 +279,12 @@ pub const Editor = struct {
                 }) catch buf[0..0];
                 setText(self.statuses[w], text, greenColor());
                 setText(self.carets[w], "", null);
-                if (notify) self.model.apply(self.model.ctx, w, settings, &self.tables[w]);
+                if (notify) {
+                    if (self.host.instance()) |engine| {
+                        engine.apply(w, settings, &self.tables[w]);
+                        self.host.stateChanged();
+                    }
+                }
             },
             .err => |problem| {
                 self.valid[w] = false;
@@ -303,7 +308,8 @@ pub const Editor = struct {
     // Parameters ---------------------------------------------------------------
 
     fn param(self: *const Editor, id: params.Id) f32 {
-        return self.model.get_param(self.model.ctx, id);
+        const engine = self.host.instance() orelse return params.info(id).default;
+        return engine.params.get(id);
     }
 
     fn envValues(self: *const Editor) graph.Values {
@@ -315,15 +321,21 @@ pub const Editor = struct {
         };
     }
 
+    fn beginEdit(self: *Editor, id: params.Id) void {
+        self.host.beginEdit(@intFromEnum(id));
+    }
+
+    fn endEdit(self: *Editor, id: params.Id) void {
+        self.host.endEdit(@intFromEnum(id));
+    }
+
     fn setParam(self: *Editor, id: params.Id, plain: f32) void {
-        self.model.set_param(self.model.ctx, id, plain);
+        self.host.setParam(@intFromEnum(id), plain);
     }
 
     /// A complete one-shot edit (typed value, double-click reset, scroll).
     fn editParam(self: *Editor, id: params.Id, plain: f32) void {
-        self.model.begin_edit(self.model.ctx, id);
-        self.setParam(id, plain);
-        self.model.end_edit(self.model.ctx, id);
+        self.host.editParam(@intFromEnum(id), plain);
     }
 
     /// Brings knob, graph and fields in line with the current values.
@@ -382,20 +394,22 @@ pub const Editor = struct {
     // Envelope view --------------------------------------------------------------
 
     fn envLayout(self: *const Editor) graph.Layout {
-        return graph.Layout.init(env_rect.size.width, env_rect.size.height, self.env_span);
+        var l = graph.Layout.init(env_rect.size.width, env_rect.size.height, self.env_span);
+        l.max_ms = params.info(.attack).max;
+        return l;
     }
 
     fn envMouseDown(self: *Editor, p: objc.NSPoint, clicks: isize) void {
         const values = self.envValues();
         const h = self.envLayout().hit(values, .{ .x = p.x, .y = p.y }, 12) orelse return;
         if (clicks >= 2) {
-            for (graph.affected(h)) |id| self.editParam(id, params.info(id).default);
+            for (envParams(h)) |id| self.editParam(id, params.info(id).default);
             self.refresh();
             return;
         }
         const q = self.envLayout().handlePoint(values, h);
         self.env_drag = .{ .handle = h, .dx = q.x - p.x, .dy = q.y - p.y };
-        for (graph.affected(h)) |id| self.model.begin_edit(self.model.ctx, id);
+        for (envParams(h)) |id| self.beginEdit(id);
         msg(void, self.env_view, "setNeedsDisplay:", .{objc.YES});
     }
 
@@ -403,7 +417,7 @@ pub const Editor = struct {
         const d = self.env_drag orelse return;
         const values = self.envValues();
         const next = self.envLayout().drag(values, d.handle, .{ .x = p.x + d.dx, .y = p.y + d.dy });
-        for (graph.affected(d.handle)) |id| {
+        for (envParams(d.handle)) |id| {
             const v = switch (id) {
                 .attack => next.attack_ms,
                 .decay => next.decay_ms,
@@ -418,7 +432,7 @@ pub const Editor = struct {
 
     fn envMouseUp(self: *Editor) void {
         const d = self.env_drag orelse return;
-        for (graph.affected(d.handle)) |id| self.model.end_edit(self.model.ctx, id);
+        for (envParams(d.handle)) |id| self.endEdit(id);
         self.env_drag = null;
         self.env_span = graph.Layout.fitSpan(self.envValues());
         msg(void, self.env_view, "setNeedsDisplay:", .{objc.YES});
@@ -560,11 +574,8 @@ pub const Editor = struct {
 
     // Mix slider -------------------------------------------------------------------
 
-    const slider_inset = 9;
-
     fn sliderValue(x: CGFloat) f32 {
-        const t = (x - slider_inset) / (slider_rect.size.width - 2 * slider_inset);
-        return @floatCast(std.math.clamp(t, 0, 1) * 100);
+        return @floatCast(widgets.sliderValue(x, slider_rect.size.width) * 100);
     }
 
     fn sliderMouseDown(self: *Editor, p: objc.NSPoint, clicks: isize) void {
@@ -575,7 +586,7 @@ pub const Editor = struct {
         }
         // Clicking anywhere on the track jumps there, then drags.
         self.slider_dragging = true;
-        self.model.begin_edit(self.model.ctx, .mix);
+        self.beginEdit(.mix);
         self.setParam(.mix, sliderValue(p.x));
         self.refresh();
     }
@@ -589,7 +600,7 @@ pub const Editor = struct {
     fn sliderMouseUp(self: *Editor) void {
         if (!self.slider_dragging) return;
         self.slider_dragging = false;
-        self.model.end_edit(self.model.ctx, .mix);
+        self.endEdit(.mix);
     }
 
     fn sliderScroll(self: *Editor, delta: CGFloat) void {
@@ -599,33 +610,9 @@ pub const Editor = struct {
     }
 
     fn drawSlider(self: *Editor) void {
-        const ctx = objc.currentCGContext();
-        const w = slider_rect.size.width;
-        const mid = slider_rect.size.height / 2;
-        const x0: CGFloat = slider_inset;
-        const x1 = w - slider_inset;
-        const m: CGFloat = self.param(.mix) / 100.0;
-        const x = x0 + (x1 - x0) * m;
-
-        objc.CGContextSetLineCap(ctx, 1);
-        objc.CGContextSetLineWidth(ctx, 4);
-        objc.CGContextSetRGBStrokeColor(ctx, 1, 1, 1, 0.1);
-        objc.CGContextBeginPath(ctx);
-        objc.CGContextMoveToPoint(ctx, x0, mid);
-        objc.CGContextAddLineToPoint(ctx, x1, mid);
-        objc.CGContextStrokePath(ctx);
-
         // The filled part takes the colour of the blend at the thumb.
-        const c = mixColor(m);
-        objc.CGContextSetRGBStrokeColor(ctx, c[0], c[1], c[2], 1);
-        objc.CGContextBeginPath(ctx);
-        objc.CGContextMoveToPoint(ctx, x0, mid);
-        objc.CGContextAddLineToPoint(ctx, x, mid);
-        objc.CGContextStrokePath(ctx);
-
-        const r: CGFloat = if (self.slider_dragging) 8 else 7;
-        objc.CGContextSetRGBFillColor(ctx, 1, 1, 1, 1);
-        objc.CGContextFillEllipseInRect(ctx, NSRect.make(x - r, mid - r, 2 * r, 2 * r));
+        const m: CGFloat = self.param(.mix) / 100.0;
+        widgets.drawSlider(slider_rect.size, m, mixColor(m), self.slider_dragging);
     }
 
     // Gain knob ------------------------------------------------------------------
@@ -638,13 +625,14 @@ pub const Editor = struct {
             return;
         }
         self.knob_drag = .{ .start_y = p.y, .start = info.toNormalized(self.param(.gain)) };
-        self.model.begin_edit(self.model.ctx, .gain);
+        self.beginEdit(.gain);
     }
 
     fn knobMouseDragged(self: *Editor, p: objc.NSPoint, fine: bool) void {
         const d = self.knob_drag orelse return;
         // 200 px of travel covers the whole range; Shift makes it 10x finer.
-        const per_px: f64 = if (fine) 1.0 / 2000.0 else 1.0 / 200.0;
+        const range: f64 = if (fine) 10 * widgets.knob_drag_range else widgets.knob_drag_range;
+        const per_px = 1.0 / range;
         self.setParam(.gain, params.info(.gain).fromNormalized(d.start + (p.y - d.start_y) * per_px));
         self.refresh();
     }
@@ -652,7 +640,7 @@ pub const Editor = struct {
     fn knobMouseUp(self: *Editor) void {
         if (self.knob_drag == null) return;
         self.knob_drag = null;
-        self.model.end_edit(self.model.ctx, .gain);
+        self.endEdit(.gain);
     }
 
     fn knobScroll(self: *Editor, delta: CGFloat) void {
@@ -663,37 +651,7 @@ pub const Editor = struct {
     }
 
     fn drawKnob(self: *Editor) void {
-        const ctx = objc.currentCGContext();
-        const cx = knob_rect.size.width / 2;
-        const cy = knob_rect.size.height / 2;
-        const r = @min(cx, cy) - 8;
-        const start = 1.25 * std.math.pi;
-        const sweep = 1.5 * std.math.pi;
-        const n = params.info(.gain).toNormalized(self.param(.gain));
-        const angle = start - n * sweep;
-
-        objc.CGContextSetLineCap(ctx, 1); // round
-        objc.CGContextSetLineWidth(ctx, 6);
-        objc.CGContextSetRGBStrokeColor(ctx, 1, 1, 1, 0.1);
-        objc.CGContextBeginPath(ctx);
-        objc.CGContextAddArc(ctx, cx, cy, r, start, start - sweep, 1);
-        objc.CGContextStrokePath(ctx);
-
-        objc.CGContextSetRGBStrokeColor(ctx, accent[0], accent[1], accent[2], 1);
-        objc.CGContextBeginPath(ctx);
-        objc.CGContextAddArc(ctx, cx, cy, r, start, angle, 1);
-        objc.CGContextStrokePath(ctx);
-
-        const inner = r - 10;
-        objc.CGContextSetRGBFillColor(ctx, 0.17, 0.18, 0.21, 1);
-        objc.CGContextFillEllipseInRect(ctx, NSRect.make(cx - inner, cy - inner, 2 * inner, 2 * inner));
-
-        objc.CGContextSetLineWidth(ctx, 3);
-        objc.CGContextSetRGBStrokeColor(ctx, 1, 1, 1, 0.9);
-        objc.CGContextBeginPath(ctx);
-        objc.CGContextMoveToPoint(ctx, cx + @cos(angle) * inner * 0.35, cy + @sin(angle) * inner * 0.35);
-        objc.CGContextAddLineToPoint(ctx, cx + @cos(angle) * (inner - 4), cy + @sin(angle) * (inner - 4));
-        objc.CGContextStrokePath(ctx);
+        widgets.drawKnob(knob_rect.size, params.info(.gain).toNormalized(self.param(.gain)), accent);
     }
 
     fn drawWave(self: *Editor) void {
@@ -832,6 +790,16 @@ const msg = objc.msg;
 extern var NSAppearanceNameDarkAqua: Id;
 extern var NSRunLoopCommonModes: Id;
 extern fn NSRectFill(rect: NSRect) void;
+
+/// The parameters dragging an envelope point changes.
+fn envParams(h: graph.Handle) []const params.Id {
+    return switch (h) {
+        .peak => &.{.attack},
+        .decay => &.{ .decay, .sustain },
+        .sustain => &.{.sustain},
+        .end => &.{.release},
+    };
+}
 
 fn modeFromValue(v: f32) params.Mode {
     return @enumFromInt(@as(u8, @intFromFloat(params.info(.mode).clamp(v))));
@@ -1065,10 +1033,6 @@ fn knobScrollWheel(self: Id, _: objc.Sel, event: Id) callconv(.c) void {
 
 fn waveDrawRect(self: Id, _: objc.Sel, _: NSRect) callconv(.c) void {
     if (objc.getUserdata(Editor, self)) |editor| editor.drawWave();
-}
-
-test {
-    _ = @import("envelope_graph.zig");
 }
 
 test "fmtNum" {

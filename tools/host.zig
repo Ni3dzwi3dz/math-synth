@@ -1,4 +1,5 @@
-//! Tiny VST3 host for smoke-testing MathSynth without a DAW.
+//! Tiny VST3 host for smoke-testing a plugin without a DAW. `interact` is
+//! specific to MathSynth's editor; the other commands work for any plugin.
 //!
 //!   vst3-host <bundle.vst3> info
 //!   vst3-host <bundle.vst3> render <out.wav> [--set name=value ...] [formula from to]
@@ -204,9 +205,13 @@ fn load(bundle: []const u8) Instance {
     return .{ .component = component, .processor = processor, .controller = controller };
 }
 
-/// Prints a saved state ("MSY1".."MSY3"): each wave's strings, then the
-/// parameters.
+/// Prints a saved state. MathSynth's ("MSY1".."MSY3") is decoded: each
+/// wave's strings, then the parameters.
 fn printStateBytes(bytes: []const u8) void {
+    if (bytes.len < 4 or !std.mem.eql(u8, bytes[0..3], "MSY")) {
+        std.debug.print("plugin state: {d} bytes\n", .{bytes.len});
+        return;
+    }
     const version = bytes[3];
     const waves: usize = if (version >= '3') 2 else 1;
     var pos: usize = 4;

@@ -1,6 +1,6 @@
-//! Format-independent core shared by the VST3 and Audio Unit wrappers: the
-//! synth, the wavetable handoff to the audio thread, the user's settings for
-//! both waves and their serialised form.
+//! MathSynth's plugin instance (see common/plugin.zig): the synth, the
+//! wavetable handoff to the audio thread, the user's settings for both waves,
+//! the parameters and the saved state.
 
 const std = @import("std");
 const wt = @import("wavetable.zig");
@@ -56,7 +56,7 @@ pub const Engine = struct {
 
     /// Validates and applies saved state. Returns false (changing nothing)
     /// if either formula doesn't compile.
-    pub fn load(e: *Engine, state: *const State) bool {
+    pub fn applyState(e: *Engine, state: *const State) bool {
         var tables: [wave_count]wt.Table = undefined;
         for (&state.settings, &tables) |*settings, *table| {
             if (wt.build(settings, table) != .ok) return false;
@@ -66,8 +66,50 @@ pub const Engine = struct {
         return true;
     }
 
-    pub fn saveState(e: *Engine) State {
+    pub fn currentState(e: *Engine) State {
         return .{ .settings = e.currentSettings(), .params = e.params.snapshot() };
+    }
+
+    // Plugin interface (common/plugin.zig) ---------------------------------------
+
+    pub const max_state_len = engine_max_state_len;
+
+    pub fn saveState(e: *Engine, buf: *[max_state_len]u8) []const u8 {
+        const state = e.currentState();
+        return serialize(&state, buf);
+    }
+
+    pub fn loadState(e: *Engine, bytes: []const u8) bool {
+        const state = deserialize(bytes) orelse return false;
+        return e.applyState(&state);
+    }
+
+    pub fn getParam(e: *const Engine, index: u32) f32 {
+        return e.params.getIndex(index);
+    }
+
+    pub fn setParam(e: *Engine, index: u32, plain: f32) void {
+        e.params.setIndex(index, plain);
+    }
+
+    pub fn setSampleRate(e: *Engine, rate: f64) void {
+        e.synth.setSampleRate(rate);
+    }
+
+    pub fn reset(e: *Engine) void {
+        e.synth.reset();
+    }
+
+    pub fn noteOn(e: *Engine, pitch: i16, tuning_cents: f32, velocity: f32, note_id: i32) void {
+        e.synth.noteOn(pitch, tuning_cents, velocity, note_id);
+    }
+
+    pub fn noteOff(e: *Engine, pitch: i16, note_id: i32) void {
+        e.synth.noteOff(pitch, note_id);
+    }
+
+    pub fn allNotesOff(e: *Engine) void {
+        e.synth.allNotesOff();
     }
 
     /// Seconds a note keeps sounding after note-off.
@@ -149,9 +191,9 @@ pub const State = struct {
 // Version 2 ("MSY2") has one wave; version 1 ("MSY1") also has no
 // parameters. Older states load with defaults for what they lack.
 const magic = "MSY3";
-pub const max_state_len = 4 + wave_count * (3 + wt.max_formula_len + 2 * wt.max_range_len) + 4 * params.count;
+const engine_max_state_len = 4 + wave_count * (3 + wt.max_formula_len + 2 * wt.max_range_len) + 4 * params.count;
 
-pub fn serialize(state: *const State, buf: *[max_state_len]u8) []const u8 {
+pub fn serialize(state: *const State, buf: *[engine_max_state_len]u8) []const u8 {
     @memcpy(buf[0..4], magic);
     var n: usize = 4;
     for (&state.settings) |*settings| {
@@ -208,7 +250,7 @@ test {
 }
 
 test "state round trip" {
-    var buf: [max_state_len]u8 = undefined;
+    var buf: [engine_max_state_len]u8 = undefined;
     var in: State = .{ .settings = .{
         wt.Settings.init("sin(x) + 0.5sin(2x)", "-pi", "pi"),
         wt.Settings.init("x", "0", "1"),
