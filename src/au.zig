@@ -39,6 +39,7 @@ const prop_class_info = 0;
 const prop_sample_rate = 2;
 const prop_parameter_list = 3;
 const prop_parameter_info = 4;
+const prop_parameter_value_strings = 16;
 const prop_stream_format = 8;
 const prop_element_count = 11;
 const prop_latency = 12;
@@ -135,6 +136,7 @@ const param_flag_has_cf_name: u32 = 0x08000000;
 const param_flag_cf_name_release: u32 = 0x10;
 const param_flag_display_cubed: u32 = 0x30000;
 
+const unit_indexed: u32 = 1;
 const unit_percent: u32 = 3;
 const unit_decibels: u32 = 13;
 const unit_milliseconds: u32 = 24;
@@ -187,6 +189,8 @@ extern fn CFNumberCreate(alloc: CFTypeRef, kind: isize, value: *const anyopaque)
 extern fn CFDictionaryCreateMutable(alloc: CFTypeRef, capacity: isize, keys: *const anyopaque, values: *const anyopaque) CFTypeRef;
 extern fn CFDictionarySetValue(dict: CFTypeRef, key: CFTypeRef, value: CFTypeRef) void;
 extern fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) CFTypeRef;
+extern fn CFArrayCreate(alloc: CFTypeRef, values: [*]const CFTypeRef, count: isize, callbacks: *const anyopaque) CFTypeRef;
+extern var kCFTypeArrayCallBacks: u8;
 extern fn CFURLCreateFromFileSystemRepresentation(alloc: CFTypeRef, path: [*]const u8, len: isize, is_dir: bool) CFTypeRef;
 extern var kCFTypeDictionaryKeyCallBacks: u8;
 extern var kCFTypeDictionaryValueCallBacks: u8;
@@ -475,6 +479,8 @@ fn describe(id: u32, scope: u32, element: u32) Described {
             .{ .info = .{ .size = 4 * params.count, .writable = false } }
         else if (scope <= scope_output) .{ .info = .{ .size = 0, .writable = false } } else bad,
         prop_parameter_info => if (global_only and params.fromIndex(element) != null) info(ParameterInfo, false) else .{ .err = err_invalid_parameter },
+        // Names for list parameters ("Sum", "FM", "Ring").
+        prop_parameter_value_strings => if (global_only and isListParam(element)) info(CFTypeRef, false) else .{ .err = err_invalid_property },
         prop_element_count => if (scope <= scope_output) info(u32, false) else bad,
         prop_latency, prop_tail_time => if (global_only) info(f64, false) else bad,
         prop_supported_num_channels => if (global_only) .{ .info = .{ .size = @sizeOf(ChannelInfo) * supported_channels.len, .writable = false } } else bad,
@@ -529,6 +535,7 @@ fn getProperty(self: *anyopaque, id: u32, scope: u32, element: u32, out: ?*anyop
             @as([*]align(1) u32, @ptrCast(dst))[i] = @intCast(i);
         },
         prop_parameter_info => write(ParameterInfo, dst, parameterInfo(params.fromIndex(element).?)),
+        prop_parameter_value_strings => write(CFTypeRef, dst, valueStrings(params.fromIndex(element).?)),
         prop_supported_num_channels => @as(*[supported_channels.len]ChannelInfo, @ptrCast(@alignCast(dst))).* = supported_channels,
         prop_maximum_frames_per_slice => write(u32, dst, inst.max_frames),
         prop_last_render_error => {
@@ -715,6 +722,7 @@ fn parameterInfo(id: params.Id) ParameterInfo {
             .decibels => unit_decibels,
             .milliseconds => unit_milliseconds,
             .percent => unit_percent,
+            .list => unit_indexed,
         },
         .minValue = i.min,
         .maxValue = i.max,
@@ -725,6 +733,21 @@ fn parameterInfo(id: params.Id) ParameterInfo {
     };
     @memcpy(out.name[0..i.name.len], i.name);
     return out;
+}
+
+fn isListParam(element: u32) bool {
+    const id = params.fromIndex(element) orelse return false;
+    return params.info(id).unit == .list;
+}
+
+/// +1 CFArray of the value names, for the host to release.
+fn valueStrings(id: params.Id) CFTypeRef {
+    const choices = params.info(id).choices;
+    var strings: [8]CFTypeRef = undefined;
+    for (choices, 0..) |choice, i| strings[i] = cfString(choice);
+    const array = CFArrayCreate(null, &strings, @intCast(choices.len), &kCFTypeArrayCallBacks);
+    for (strings[0..choices.len]) |str| CFRelease(str); // the array retains them
+    return array;
 }
 
 fn getParameter(self: *anyopaque, raw_id: u32, scope: u32, element: u32, out: ?*f32) callconv(.c) OSStatus {

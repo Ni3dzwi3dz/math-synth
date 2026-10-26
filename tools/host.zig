@@ -1,8 +1,8 @@
 //! Tiny VST3 host for smoke-testing MathSynth without a DAW.
 //!
 //!   vst3-host <bundle.vst3> info
-//!   vst3-host <bundle.vst3> render <out.wav> [formula from to]
-//!   vst3-host <bundle.vst3> snapshot <out.png> [formula1 [from1 [to1 [formula2 [from2 [to2]]]]]]
+//!   vst3-host <bundle.vst3> render <out.wav> [--set name=value ...] [formula from to]
+//!   vst3-host <bundle.vst3> snapshot <out.png> [--set name=value ...] [formula1 [from1 [to1 [formula2 [from2 [to2]]]]]]
 //!   vst3-host <bundle.vst3> interact <out.png>
 //!   vst3-host <bundle.vst3> gui
 //!
@@ -218,7 +218,7 @@ fn printStateBytes(bytes: []const u8) void {
             pos += 1 + n;
         }
     }
-    for ([_][]const u8{ "gain", "attack", "decay", "sustain", "release", "mix" }) |label| {
+    for ([_][]const u8{ "gain", "attack", "decay", "sustain", "release", "mix", "mode" }) |label| {
         if (pos + 4 > bytes.len) break;
         const v: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
         std.debug.print(" {s}={d:.2}", .{ label, v });
@@ -402,7 +402,45 @@ fn typeIntoEditor(content: Id, texts: []const [:0]const u8) void {
     msg(void, root, "controlTextDidChange:", .{@as(Id, null)});
 }
 
-fn snapshot(inst: Instance, path: [:0]const u8, texts: []const [:0]const u8) void {
+/// Sets a parameter by name from text, like a host's generic editor would
+/// ("mode=FM", "mix=60", "release=1.5 s").
+fn setParam(inst: Instance, assignment: []const u8) void {
+    const eq = std.mem.indexOfScalar(u8, assignment, '=') orelse fail("--set wants name=value, got {s}", .{assignment});
+    const name = assignment[0..eq];
+    const value = assignment[eq + 1 ..];
+    const count = vt(inst.controller).getParameterCount.?(inst.controller);
+    var i: i32 = 0;
+    while (i < count) : (i += 1) {
+        var info: c.struct_Steinberg_Vst_ParameterInfo = .{};
+        check(vt(inst.controller).getParameterInfo.?(inst.controller, i, &info), "getParameterInfo");
+        var title: [64]u8 = undefined;
+        var n: usize = 0;
+        while (n < title.len and info.title[n] != 0) : (n += 1) title[n] = @intCast(info.title[n]);
+        if (!std.ascii.eqlIgnoreCase(title[0..n], name)) continue;
+        var text: c.Steinberg_Vst_String128 = @splat(0);
+        for (value, 0..) |ch, k| text[k] = ch;
+        var normalized: f64 = 0;
+        check(vt(inst.controller).getParamValueByString.?(inst.controller, info.id, &text, &normalized), "getParamValueByString");
+        check(vt(inst.controller).setParamNormalized.?(inst.controller, info.id, normalized), "setParamNormalized");
+        return;
+    }
+    fail("no parameter named {s}", .{name});
+}
+
+fn snapshot(inst: Instance, path: [:0]const u8, all_args: []const [:0]const u8) void {
+    var texts_buf: [8][:0]const u8 = undefined;
+    var n_texts: usize = 0;
+    var i: usize = 0;
+    while (i < all_args.len) : (i += 1) {
+        if (std.mem.eql(u8, all_args[i], "--set") and i + 1 < all_args.len) {
+            setParam(inst, all_args[i + 1]);
+            i += 1;
+        } else if (n_texts < texts_buf.len) {
+            texts_buf[n_texts] = all_args[i];
+            n_texts += 1;
+        }
+    }
+    const texts = texts_buf[0..n_texts];
     const ed = openEditor(inst, false);
     if (texts.len > 0) typeIntoEditor(ed.content, texts);
 
@@ -492,7 +530,7 @@ fn drag(view: Id, from: objc.NSPoint, to: objc.NSPoint) void {
 }
 
 fn printParams(inst: Instance) void {
-    const names = [_][]const u8{ "gain", "attack", "decay", "sustain", "release", "mix" };
+    const names = [_][]const u8{ "gain", "attack", "decay", "sustain", "release", "mix", "mode" };
     std.debug.print("params:", .{});
     for (names, 0..) |name, i| {
         const id: c.Steinberg_Vst_ParamID = @intCast(i);
@@ -529,10 +567,17 @@ fn interact(inst: Instance, path: [:0]const u8) void {
     std.debug.print("after dragging the knob down 50 px:\n", .{});
     printParams(inst);
 
-    // Mix slider (390 px wide, 9 px inset): from 0 % to x = 9 + 0.25 * 372.
+    // Mix slider (276 px wide, 9 px inset): from 0 % to x = 9 + 0.25 * 258.
     const slider = findSubview(root, "MathSynthSliderView");
-    drag(slider, .{ .x = 9, .y = 11 }, .{ .x = 102, .y = 11 });
+    drag(slider, .{ .x = 9, .y = 11 }, .{ .x = 73.5, .y = 11 });
     std.debug.print("after dragging the mix slider to a quarter:\n", .{});
+    printParams(inst);
+
+    // Switch to FM with the mode control, as a click would.
+    const mode = findField(root, "mode");
+    msg(void, mode, "setSelectedSegment:", .{@as(isize, 1)});
+    msg(void, root, "modeChanged:", .{mode});
+    std.debug.print("after choosing FM:\n", .{});
     printParams(inst);
 
     // Type into the Attack field and commit it (Return / focus out).
@@ -579,7 +624,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (std.mem.eql(u8, cmd, "info")) {
         printState(inst);
     } else if (std.mem.eql(u8, cmd, "render") and args.len >= 4) {
-        if (args.len >= 7) setFormula(inst, args[4], args[5], args[6]);
+        // render <out.wav> [--set name=value ...] [formula from to]
+        var rest = args[4..];
+        while (rest.len >= 2 and std.mem.eql(u8, rest[0], "--set")) : (rest = rest[2..]) setParam(inst, rest[1]);
+        if (rest.len >= 3) setFormula(inst, rest[0], rest[1], rest[2]);
         printState(inst);
         render(inst, args[3]);
     } else if (std.mem.eql(u8, cmd, "snapshot") and args.len >= 4) {

@@ -565,10 +565,11 @@ fn getParameterInfo(_: ?*anyopaque, index: i32, out: [*c]c.struct_Steinberg_Vst_
     const i = params.info(id);
     out.* = .{
         .id = @intFromEnum(id),
-        .stepCount = 0,
+        .stepCount = @intCast(i.steps()),
         .defaultNormalizedValue = i.toNormalized(i.default),
         .unitId = c.Steinberg_Vst_kRootUnitId,
-        .flags = c.Steinberg_Vst_ParameterInfo_ParameterFlags_kCanAutomate,
+        .flags = c.Steinberg_Vst_ParameterInfo_ParameterFlags_kCanAutomate |
+            (if (i.unit == .list) c.Steinberg_Vst_ParameterInfo_ParameterFlags_kIsList else 0),
     };
     copyString128(&out.*.title, i.name);
     copyString128(&out.*.shortTitle, i.short_name);

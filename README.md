@@ -8,9 +8,22 @@ as well as VST3 hosts.
 
 There are two waves, f₁ and f₂. For each, type a formula in `x` and choose
 the `x` range that makes up one period; the synth turns it into a
-single-cycle wavetable. The **Mix** slider crossfades between them: 0 % plays
-only f₁, 100 % only f₂, and values in between blend the two. The plot shows
-both waves as thin lines and the blend, which is what you hear, in bold.
+single-cycle wavetable. The **Sum / FM / Ring** switch picks how the two are
+combined, and the slider next to it sets how much:
+
+| Mode | 0 % | 100 % |
+|---|---|---|
+| Sum | only f₁ | only f₂ (crossfade in between) |
+| FM | only f₁ | f₂ pushes f₁'s phase by up to 2 cycles (phase modulation, 1:1) |
+| Ring | only f₁ | f₁ × f₂ |
+
+The plot shows both waves as thin lines and the result, which is what you
+hear, in bold. It uses the same calculation as the synth.
+
+Both waves play at the note's pitch, so FM and ring modulation are 1:1 and
+always harmonic. FM works best with a smooth modulator such as `sin(x)`: a
+square (`sign(sin(x))`) is only ever ±1, so it shifts f₁'s phase in jumps,
+and at 50 % and 100 % those jumps are whole cycles that leave f₁ unchanged.
 
 The editor checks the input on every keystroke: valid input updates the
 preview and the sound right away. Invalid input shows the error and points at
@@ -40,12 +53,13 @@ Below the plot are an ADSR envelope and an output gain knob.
 | Decay | 0 to 10 000 ms | 250 ms |
 | Sustain | 0 to 100 % | 70 % |
 | Release | 0 to 10 000 ms | 300 ms |
-| Mix | 0 % (only f₁) to 100 % (only f₂) | 0 % |
+| Mix | 0 to 100 % (amount for the mode) | 0 % |
+| Mode | Sum, FM, Ring | Sum |
 
 The mix slider works like the knob: click or drag along it, scroll, or
 double-click to reset, and the field next to it accepts typed values.
 
-All six are automatable parameters in both formats, so hosts can record and
+All seven are automatable parameters in both formats, so hosts can record and
 automate them. In GarageBand they appear as Smart Controls knobs. The envelope
 is linear, and every segment is at least 1 ms long so even 0 ms settings don't
 click.
@@ -79,8 +93,8 @@ Some examples to try:
 
 Each formula is sampled into a 2048-point table across `[from, to)`. The table
 is then centred (DC removed) and peak-normalised, so any formula plays at a
-reasonable level. The mix is a plain crossfade of the two tables, so opposite
-waves (`sin(x)` and `-sin(x)`) cancel out at 50 %. A formula that isn't finite anywhere in the range (for
+reasonable level. In Sum mode the result is a plain crossfade of the two
+tables, so opposite waves (`sin(x)` and `-sin(x)`) cancel out at 50 %. A formula that isn't finite anywhere in the range (for
 example `1/x` across 0) is rejected.
 
 ## Building
@@ -138,6 +152,7 @@ Two minimal hosts check the built bundles without a DAW.
 zig build host -- info
 zig build host -- render out.wav "sin(x) + 0.3sin(5x)" 0 2pi
 zig build host -- snapshot editor.png "tanh(4sin(x))" 0 2pi "x" 0 1
+zig build host -- snapshot fm.png --set mode=FM --set mix=40 "sin(x)" 0 2pi "sin(x)" 0 2pi
 zig build host -- interact editor.png
 zig build host -- gui
 ```
@@ -145,8 +160,10 @@ zig build host -- gui
 `host` drives the VST3. `render` loads the formula through the plugin state
 and plays an arpeggio into a WAV file. `snapshot` opens the editor off-screen,
 types the given formula/from/to values (f₁'s, then f₂'s) into its fields and
-saves a PNG. `interact` sends mouse events to the envelope graph, the gain
-knob and the mix slider, commits a typed attack time, and prints the resulting parameters and the edit gestures reported
+saves a PNG. `--set name=value` (for `snapshot` and `render`) sets a
+parameter by name first, the way a host's generic controls would. `interact`
+sends mouse events to the envelope graph, the gain knob and the mix slider,
+switches the mode to FM, commits a typed attack time, and prints the resulting parameters and the edit gestures reported
 to the host. `gui` opens the editor in a window. It has no audio output.
 
 ```bash
@@ -182,6 +199,7 @@ unit with AVAudioEngine and reports its level and measured pitch.
 | `src/wavetable.zig` | Input validation, table building, lock-free triple buffer to the audio thread |
 | `src/params.zig` | Gain and ADSR parameters: ranges, defaults, normalized mapping, text formatting and parsing |
 | `src/synth.zig` | 16-voice wavetable oscillator with a linear ADSR envelope |
+| `src/blend.zig` | How the two waves combine (sum, FM, ring), shared by the synth and the plot |
 | `src/engine.zig` | Format-independent core: synth, table handoff, parameters, gain, saved state |
 | `src/plugin.zig` | VST3 factory, component/processor/controller, plug view |
 | `src/au.zig` | Audio Unit v2 music device: properties, MIDI queue, render, view factory glue |

@@ -14,13 +14,27 @@ pub const Id = enum(u32) {
     decay,
     sustain,
     release,
-    /// 0 % = only wave 1, 100 % = only wave 2.
+    /// Amount for the selected `mode`: blend, FM depth or ring amount.
     mix,
+    /// How the two waves are combined; a `Mode` index.
+    mode,
 };
+
+/// Ways of combining the two waves. Order is saved: only append.
+pub const Mode = enum(u8) {
+    /// Crossfade from f1 to f2.
+    sum,
+    /// f2 modulates the phase of f1.
+    fm,
+    /// f1 multiplied by f2, blended with plain f1.
+    ring,
+};
+
+pub const mode_names = [_][]const u8{ "Sum", "FM", "Ring" };
 
 pub const count = std.enums.values(Id).len;
 
-pub const Unit = enum { decibels, milliseconds, percent };
+pub const Unit = enum { decibels, milliseconds, percent, list };
 
 pub const Info = struct {
     name: []const u8,
@@ -31,18 +45,28 @@ pub const Info = struct {
     default: f32,
     /// Normalized = ((plain - min) / (max - min)) ^ (1 / 3) when true.
     cubic: bool = false,
+    /// For `.list`: the name of each value 0, 1, 2...
+    choices: []const []const u8 = &.{},
 
     pub fn unitLabel(self: Info) []const u8 {
         return switch (self.unit) {
             .decibels => "dB",
             .milliseconds => "ms",
             .percent => "%",
+            .list => "",
         };
+    }
+
+    /// Number of discrete steps between min and max (VST3 stepCount); 0 for
+    /// continuous parameters.
+    pub fn steps(self: Info) u32 {
+        return if (self.unit == .list) @intCast(self.choices.len - 1) else 0;
     }
 
     pub fn clamp(self: Info, plain: f32) f32 {
         if (std.math.isNan(plain)) return self.default;
-        return std.math.clamp(plain, self.min, self.max);
+        const v = std.math.clamp(plain, self.min, self.max);
+        return if (self.unit == .list) @round(v) else v;
     }
 
     pub fn toNormalized(self: Info, plain: f32) f64 {
@@ -64,6 +88,7 @@ pub const Info = struct {
         // which would print as "-0.0".
         if (@abs(v) < 0.05) v = 0;
         return switch (self.unit) {
+            .list => self.choices[@intFromFloat(v)],
             .decibels => if (v <= self.min) "-inf" else std.fmt.bufPrint(buf, "{d:.1}", .{v}) catch "?",
             .milliseconds => if (v < 10)
                 std.fmt.bufPrint(buf, "{d:.1}", .{v}) catch "?"
@@ -78,11 +103,17 @@ pub const Info = struct {
     pub fn parse(self: Info, text: []const u8) ?f32 {
         var s = std.mem.trim(u8, text, " \t");
         if (self.unit == .decibels and std.ascii.eqlIgnoreCase(s, "-inf")) return self.min;
+        if (self.unit == .list) {
+            for (self.choices, 0..) |choice, i| {
+                if (std.ascii.eqlIgnoreCase(s, choice)) return @floatFromInt(i);
+            }
+        }
         var scale: f32 = 1;
         const suffixes = switch (self.unit) {
             .decibels => &[_]struct { []const u8, f32 }{.{ "db", 1 }},
             .milliseconds => &[_]struct { []const u8, f32 }{ .{ "ms", 1 }, .{ "s", 1000 } },
             .percent => &[_]struct { []const u8, f32 }{.{ "%", 1 }},
+            .list => &[_]struct { []const u8, f32 }{},
         };
         for (suffixes) |suffix| {
             if (s.len > suffix[0].len and std.ascii.endsWithIgnoreCase(s, suffix[0])) {
@@ -106,7 +137,12 @@ pub const infos = std.enums.EnumArray(Id, Info).init(.{
     .sustain = .{ .name = "Sustain", .short_name = "Sus", .unit = .percent, .min = 0, .max = 100, .default = 70 },
     .release = .{ .name = "Release", .short_name = "Rel", .unit = .milliseconds, .min = 0, .max = max_time_ms, .default = 300, .cubic = true },
     .mix = .{ .name = "Mix", .short_name = "Mix", .unit = .percent, .min = 0, .max = 100, .default = 0 },
+    .mode = .{ .name = "Mode", .short_name = "Mode", .unit = .list, .min = 0, .max = mode_names.len - 1, .default = 0, .choices = &mode_names },
 });
+
+pub fn mode(v: *const Values) Mode {
+    return @enumFromInt(@as(u8, @intFromFloat(v.get(.mode))));
+}
 
 pub fn info(id: Id) Info {
     return infos.get(id);
@@ -149,6 +185,7 @@ pub fn dbToGain(db: f32) f32 {
 test "normalized round trip" {
     for (std.enums.values(Id)) |id| {
         const i = info(id);
+        if (i.unit == .list) continue; // snaps to steps; tested separately
         for ([_]f64{ 0, 0.1, 0.5, 0.9, 1 }) |n| {
             try std.testing.expectApproxEqAbs(n, i.toNormalized(i.fromNormalized(n)), 1e-5);
         }
@@ -174,6 +211,20 @@ test "format and parse" {
     try std.testing.expectEqual(@as(?f32, 55), info(.sustain).parse("55%"));
     try std.testing.expectEqual(@as(?f32, null), info(.sustain).parse("abc"));
     try std.testing.expectEqual(@as(?f32, null), info(.sustain).parse(""));
+}
+
+test "list parameter" {
+    const i = info(.mode);
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 2), i.steps());
+    try std.testing.expectEqualStrings("FM", i.format(&buf, 1));
+    try std.testing.expectEqual(@as(?f32, 2), i.parse("ring"));
+    try std.testing.expectEqual(@as(?f32, 1), i.parse("1"));
+    try std.testing.expectEqual(@as(f32, 1), i.fromNormalized(0.6)); // nearest step
+    try std.testing.expectEqual(@as(f64, 0.5), i.toNormalized(1));
+    var v: Values = .{};
+    v.set(.mode, 2.4);
+    try std.testing.expectEqual(Mode.ring, mode(&v));
 }
 
 test "values default and clamp" {

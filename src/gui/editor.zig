@@ -9,6 +9,7 @@ const objc = @import("objc.zig");
 const wt = @import("../wavetable.zig");
 const params = @import("../params.zig");
 const graph = @import("envelope_graph.zig");
+const blend = @import("../blend.zig");
 
 const Id = objc.Id;
 const NSRect = objc.NSRect;
@@ -27,7 +28,8 @@ const margin = 20;
 const wave_row_y = [wave_count]CGFloat{ 52, 98 };
 const status_y = 146;
 const mix_y = 190;
-const slider_rect = NSRect.make(104, mix_y, 390, 22);
+const mode_rect = NSRect.make(margin, mix_y - 1, 150, 24);
+const slider_rect = NSRect.make(200, mix_y, 276, 22);
 const wave_rect = NSRect.make(margin, 226, width - 2 * margin, 176);
 const section_y = 434;
 const env_rect = NSRect.make(margin, 458, 470, 150);
@@ -74,6 +76,11 @@ pub const Editor = struct {
     valid: [wave_count]bool = @splat(false),
     slider_view: Id = null,
     slider_dragging: bool = false,
+    mode_control: Id = null,
+    /// Slider end labels and the plot legend entry, which depend on the mode.
+    slider_left: Id = null,
+    slider_right: Id = null,
+    result_legend: Id = null,
 
     env_view: Id = null,
     knob_view: Id = null,
@@ -124,13 +131,23 @@ pub const Editor = struct {
             self.statuses[w] = self.label("", NSRect.make(margin, status_y + @as(CGFloat, @floatFromInt(w)) * 18, width - 2 * margin, 18), systemFont(12), labelColor());
         }
 
-        // Mix slider: f1 on the left, f2 on the right.
-        _ = self.label("Mix", NSRect.make(margin, mix_y + 2, 40, 18), boldFont(13), labelColor());
-        _ = self.label(wave_names[0], NSRect.make(slider_rect.origin.x - 20, mix_y + 2, 18, 18), monoFont(13), objc.color(wave_colors[0][0], wave_colors[0][1], wave_colors[0][2], 1));
-        _ = self.label(wave_names[1], NSRect.make(slider_rect.origin.x + slider_rect.size.width + 4, mix_y + 2, 18, 18), monoFont(13), objc.color(wave_colors[1][0], wave_colors[1][1], wave_colors[1][2], 1));
+        // Mode switch, then the amount slider for that mode.
+        var mode_labels: [params.mode_names.len]Id = undefined;
+        for (&mode_labels, params.mode_names) |*l, name| l.* = objc.nsString(name);
+        const labels_array = objc.classMsg(Id, "NSArray", "arrayWithObjects:count:", .{ @as([*]Id, &mode_labels), mode_labels.len });
+        const NSSegmentSwitchTrackingSelectOne: usize = 0;
+        self.mode_control = objc.classMsg(Id, "NSSegmentedControl", "segmentedControlWithLabels:trackingMode:target:action:", .{
+            labels_array, NSSegmentSwitchTrackingSelectOne, root, objc.sel("modeChanged:"),
+        });
+        msg(void, self.mode_control, "setFrame:", .{mode_rect});
+        msg(void, self.mode_control, "setIdentifier:", .{objc.nsString("mode")});
+        msg(void, self.mode_control, "setToolTip:", .{objc.nsString("How f\u{2082} combines with f\u{2081}: crossfade (Sum), phase modulation (FM) or multiplication (Ring)")});
+        msg(void, root, "addSubview:", .{self.mode_control});
+
+        self.slider_left = self.label(wave_names[0], NSRect.make(slider_rect.origin.x - 20, mix_y + 2, 18, 18), monoFont(13), objc.color(wave_colors[0][0], wave_colors[0][1], wave_colors[0][2], 1));
+        self.slider_right = self.label("", NSRect.make(slider_rect.origin.x + slider_rect.size.width + 4, mix_y + 2, 52, 18), monoFont(13), objc.color(wave_colors[1][0], wave_colors[1][1], wave_colors[1][2], 1));
         self.slider_view = self.customView(cls.slider, slider_rect);
-        msg(void, self.slider_view, "setToolTip:", .{objc.nsString("Drag to blend the two waves. Double-click to reset to f\u{2081} only.")});
-        const mix_field_x = slider_rect.origin.x + slider_rect.size.width + 30;
+        const mix_field_x = slider_rect.origin.x + slider_rect.size.width + 56;
         self.param_fields[@intFromEnum(params.Id.mix)] = self.input(NSRect.make(mix_field_x, mix_y, 52, 22), monoFont(12), "", "mix");
         msg(void, self.param_fields[@intFromEnum(params.Id.mix)], "setAlignment:", .{NSTextAlignmentRight});
         _ = self.label("%", NSRect.make(mix_field_x + 56, mix_y + 3, 20, 16), systemFont(11), secondaryColor());
@@ -146,16 +163,14 @@ pub const Editor = struct {
         _ = self.label("0", NSRect.make(margin, axis_y, 100, 16), monoFont(11), secondaryColor());
         const period_label = self.label("1 period", NSRect.make(width - margin - 100, axis_y, 100, 16), monoFont(11), secondaryColor());
         msg(void, period_label, "setAlignment:", .{NSTextAlignmentRight});
-        const legend = [_]struct { []const u8, [3]CGFloat }{
-            .{ "\u{2014} f\u{2081}", wave_colors[0] },
-            .{ "\u{2014} f\u{2082}", wave_colors[1] },
-            .{ "\u{2014} mix (what plays)", accent },
-        };
-        var lx: CGFloat = width / 2 - 120;
-        for (legend) |item| {
-            _ = self.label(item[0], NSRect.make(lx, axis_y, 140, 16), systemFont(11), objc.color(item[1][0], item[1][1], item[1][2], 1));
-            lx += if (item[0].len < 12) 52 else 140;
+        const lx: CGFloat = 150;
+        for (0..wave_count) |w| {
+            const c = wave_colors[w];
+            var buf: [16]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "\u{2014} {s}", .{wave_names[w]}) catch "";
+            _ = self.label(text, NSRect.make(lx + @as(CGFloat, @floatFromInt(w)) * 50, axis_y, 48, 16), systemFont(11), objc.color(c[0], c[1], c[2], 1));
         }
+        self.result_legend = self.label("", NSRect.make(lx + 100, axis_y, 280, 16), systemFont(11), objc.color(accent[0], accent[1], accent[2], 1));
 
         // Envelope and gain -----------------------------------------------
         _ = self.label("Envelope", NSRect.make(margin, section_y, 200, 18), boldFont(13), labelColor());
@@ -209,6 +224,7 @@ pub const Editor = struct {
         objc.setUserdata(self.env_view, null);
         objc.setUserdata(self.knob_view, null);
         objc.setUserdata(self.slider_view, null);
+        msg(void, self.mode_control, "setTarget:", .{@as(Id, null)});
         for (self.fields) |row| for (row) |f| msg(void, f, "setDelegate:", .{@as(Id, null)});
         for (self.param_fields) |f| msg(void, f, "setDelegate:", .{@as(Id, null)});
         msg(void, self.root, "removeFromSuperview", .{});
@@ -326,11 +342,16 @@ pub const Editor = struct {
                     msg(void, self.slider_view, "setNeedsDisplay:", .{objc.YES});
                     msg(void, self.wave, "setNeedsDisplay:", .{objc.YES});
                 },
+                .mode => {
+                    self.showMode(modeFromValue(v));
+                    msg(void, self.slider_view, "setNeedsDisplay:", .{objc.YES});
+                    msg(void, self.wave, "setNeedsDisplay:", .{objc.YES});
+                },
                 else => env_changed = true,
             }
             const field = self.param_fields[i];
             // Don't overwrite what the user is typing.
-            if (msg(Id, field, "currentEditor", .{}) == null) {
+            if (field != null and msg(Id, field, "currentEditor", .{}) == null) {
                 var buf: [32]u8 = undefined;
                 msg(void, field, "setStringValue:", .{objc.nsString(params.info(id).format(&buf, v))});
             }
@@ -388,7 +409,7 @@ pub const Editor = struct {
                 .decay => next.decay_ms,
                 .sustain => next.sustain_pct,
                 .release => next.release_ms,
-                .gain, .mix => unreachable,
+                .gain, .mix, .mode => unreachable,
             };
             self.setParam(id, v);
         }
@@ -509,6 +530,32 @@ pub const Editor = struct {
                 std.fmt.bufPrint(&buf, "{s}{d} ms", .{ prefix, t }) catch "";
             if (x + objc.textWidth(text, font) + 3 <= x1) objc.drawText(text, x + 3, env_rect.size.height - 12, font, text_color);
         }
+    }
+
+    // Mode -------------------------------------------------------------------------
+
+    fn currentMode(self: *const Editor) params.Mode {
+        return modeFromValue(self.param(.mode));
+    }
+
+    fn onModeChanged(self: *Editor) void {
+        const selected = msg(isize, self.mode_control, "selectedSegment", .{});
+        if (selected < 0) return;
+        self.editParam(.mode, @floatFromInt(selected));
+        self.refresh();
+    }
+
+    /// Updates everything whose wording depends on the mode.
+    fn showMode(self: *Editor, mode: params.Mode) void {
+        msg(void, self.mode_control, "setSelectedSegment:", .{@as(isize, @intFromEnum(mode))});
+        const right, const legend, const tip = switch (mode) {
+            .sum => .{ wave_names[1], "\u{2014} f\u{2081} crossfaded into f\u{2082} (what plays)", "Blend: 0 % is only f\u{2081}, 100 % only f\u{2082}. Double-click to reset." },
+            .fm => .{ "FM", "\u{2014} f\u{2082} modulates f\u{2081}'s phase (what plays)", "FM depth: how far f\u{2082} pushes f\u{2081}'s phase (100 % = 2 cycles). Double-click to reset." },
+            .ring => .{ "f\u{2081}\u{00D7}f\u{2082}", "\u{2014} f\u{2081} \u{00D7} f\u{2082} (what plays)", "Ring amount: 0 % is only f\u{2081}, 100 % is f\u{2081} \u{00D7} f\u{2082}. Double-click to reset." },
+        };
+        setText(self.slider_right, right, null);
+        setText(self.result_legend, legend, null);
+        msg(void, self.slider_view, "setToolTip:", .{objc.nsString(tip)});
     }
 
     // Mix slider -------------------------------------------------------------------
@@ -686,12 +733,13 @@ pub const Editor = struct {
         // source waves are thin lines, the mix (what plays) is bold.
         const steps: usize = @intFromFloat(w);
         const mix: f32 = self.param(.mix) / 100.0;
+        const mode = self.currentMode();
         for (0..wave_count) |wi| {
             if (!self.has_table[wi]) continue;
             const c = wave_colors[wi];
             objc.CGContextBeginPath(ctx);
             for (0..steps + 1) |px| {
-                const p = self.wavePoint(px, steps, w, mid, amp, if (wi == 0) 0 else 1);
+                const p = self.wavePoint(px, steps, w, mid, amp, if (wi == 0) .first else .second, mode, mix);
                 if (px == 0) objc.CGContextMoveToPoint(ctx, p.x, p.y) else objc.CGContextAddLineToPoint(ctx, p.x, p.y);
             }
             objc.CGContextSetLineWidth(ctx, 1.2);
@@ -705,7 +753,7 @@ pub const Editor = struct {
             objc.CGContextBeginPath(ctx);
             objc.CGContextMoveToPoint(ctx, 0, mid);
             for (0..steps + 1) |px| {
-                const p = self.wavePoint(px, steps, w, mid, amp, mix);
+                const p = self.wavePoint(px, steps, w, mid, amp, .result, mode, mix);
                 objc.CGContextAddLineToPoint(ctx, p.x, p.y);
             }
             objc.CGContextAddLineToPoint(ctx, w, mid);
@@ -715,7 +763,7 @@ pub const Editor = struct {
 
             objc.CGContextBeginPath(ctx);
             for (0..steps + 1) |px| {
-                const p = self.wavePoint(px, steps, w, mid, amp, mix);
+                const p = self.wavePoint(px, steps, w, mid, amp, .result, mode, mix);
                 if (px == 0) objc.CGContextMoveToPoint(ctx, p.x, p.y) else objc.CGContextAddLineToPoint(ctx, p.x, p.y);
             }
             objc.CGContextSetLineWidth(ctx, 2.2);
@@ -724,11 +772,15 @@ pub const Editor = struct {
         }
     }
 
-    /// Plot point for pixel column `px` of the blend `mix` (0 = wave 1,
-    /// 1 = wave 2), computed the same way the synth crossfades.
-    fn wavePoint(self: *const Editor, px: usize, steps: usize, w: CGFloat, mid: CGFloat, amp: CGFloat, mix: f32) objc.NSPoint {
-        const idx = (px * wt.size / steps) % wt.size;
-        const v = self.tables[0][idx] + (self.tables[1][idx] - self.tables[0][idx]) * mix;
+    /// Plot point for pixel column `px` of one wave or of the result, which
+    /// uses the same blend function as the synth.
+    fn wavePoint(self: *const Editor, px: usize, steps: usize, w: CGFloat, mid: CGFloat, amp: CGFloat, curve: enum { first, second, result }, mode: params.Mode, mix: f32) objc.NSPoint {
+        const phase = @as(f64, @floatFromInt(px)) / @as(f64, @floatFromInt(steps));
+        const v = switch (curve) {
+            .first => blend.lookup(&self.tables[0], phase),
+            .second => blend.lookup(&self.tables[1], phase),
+            .result => blend.sample(mode, .{ &self.tables[0], &self.tables[1] }, phase, mix),
+        };
         return .{
             .x = w * @as(CGFloat, @floatFromInt(px)) / @as(CGFloat, @floatFromInt(steps)),
             .y = mid + @as(CGFloat, v) * amp,
@@ -780,6 +832,10 @@ const msg = objc.msg;
 extern var NSAppearanceNameDarkAqua: Id;
 extern var NSRunLoopCommonModes: Id;
 extern fn NSRectFill(rect: NSRect) void;
+
+fn modeFromValue(v: f32) params.Mode {
+    return @enumFromInt(@as(u8, @intFromFloat(params.info(.mode).clamp(v))));
+}
 
 fn fieldId(buf: []u8, name: []const u8, wave: usize) []const u8 {
     return std.fmt.bufPrint(buf, "{s}{d}", .{ name, wave + 1 }) catch name;
@@ -869,6 +925,7 @@ fn registerClasses() ?Classes {
 
     root.method("controlTextDidEndEditing:", @ptrCast(&rootTextDidEndEditing), "v@:@");
     root.method("refreshTick:", @ptrCast(&rootRefreshTick), "v@:@");
+    root.method("modeChanged:", @ptrCast(&rootModeChanged), "v@:@");
 
     const wave_name = std.fmt.bufPrintZ(&name_buf, "MathSynthWaveView_{x}", .{tag}) catch return null;
     const wave = objc.ClassBuilder.begin("NSView", wave_name) orelse return null;
@@ -936,6 +993,10 @@ fn rootTextDidChange(self: Id, _: objc.Sel, notification: Id) callconv(.c) void 
 fn rootTextDidEndEditing(self: Id, _: objc.Sel, notification: Id) callconv(.c) void {
     const editor = objc.getUserdata(Editor, self) orelse return;
     if (editor.paramForField(notificationField(notification))) |id| editor.onFieldCommitted(id);
+}
+
+fn rootModeChanged(self: Id, _: objc.Sel, _: Id) callconv(.c) void {
+    if (objc.getUserdata(Editor, self)) |editor| editor.onModeChanged();
 }
 
 fn rootRefreshTick(self: Id, _: objc.Sel, _: Id) callconv(.c) void {

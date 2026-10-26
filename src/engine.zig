@@ -99,13 +99,13 @@ pub const Engine = struct {
             var at = from;
             while (at < to) {
                 const n = @min(scratch.len, to - at);
-                e.synth.render(tables, mix_to, mix_to, scratch[0..n]);
+                e.synth.render(tables, params.mode(&e.params), mix_to, mix_to, scratch[0..n]);
                 at += n;
             }
             return;
         }
         const first = channels[0][from..to];
-        e.synth.render(tables, mix_from, mix_to, first);
+        e.synth.render(tables, params.mode(&e.params), mix_from, mix_to, first);
         e.applyGain(first);
         for (channels[1..]) |ch| @memcpy(ch[from..to], first);
     }
@@ -201,6 +201,10 @@ pub fn deserialize(data: []const u8) ?State {
         }
     }
     return state;
+}
+
+test {
+    _ = @import("blend.zig");
 }
 
 test "state round trip" {

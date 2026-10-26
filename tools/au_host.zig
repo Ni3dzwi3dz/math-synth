@@ -151,7 +151,7 @@ fn printStateBytes(bytes: []const u8) void {
             pos += 1 + n;
         }
     }
-    for ([_][]const u8{ "gain", "attack", "decay", "sustain", "release", "mix" }) |label| {
+    for ([_][]const u8{ "gain", "attack", "decay", "sustain", "release", "mix", "mode" }) |label| {
         if (pos + 4 > bytes.len) break;
         const v: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
         std.debug.print(" {s}={d:.2}", .{ label, v });
