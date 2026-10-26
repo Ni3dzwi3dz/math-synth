@@ -6,13 +6,17 @@ as well as VST3 hosts.
 
 ![Editor](docs/editor.png)
 
-Type a formula in `x`, choose the `x` range that makes up one period, and the
-synth plays that shape as a single-cycle wavetable. The editor checks the input
-on every keystroke: valid input updates the preview and the sound right away.
-Invalid input shows the error and points at it, and the last valid waveform
-keeps playing.
+There are two waves, f₁ and f₂. For each, type a formula in `x` and choose
+the `x` range that makes up one period; the synth turns it into a
+single-cycle wavetable. The **Mix** slider crossfades between them: 0 % plays
+only f₁, 100 % only f₂, and values in between blend the two. The plot shows
+both waves as thin lines and the blend, which is what you hear, in bold.
 
-Below the waveform are an ADSR envelope and an output gain knob.
+The editor checks the input on every keystroke: valid input updates the
+preview and the sound right away. Invalid input shows the error and points at
+it, and that wave keeps playing its last valid shape.
+
+Below the plot are an ADSR envelope and an output gain knob.
 
 ## Envelope and gain
 
@@ -36,8 +40,12 @@ Below the waveform are an ADSR envelope and an output gain knob.
 | Decay | 0 to 10 000 ms | 250 ms |
 | Sustain | 0 to 100 % | 70 % |
 | Release | 0 to 10 000 ms | 300 ms |
+| Mix | 0 % (only f₁) to 100 % (only f₂) | 0 % |
 
-All five are automatable parameters in both formats, so hosts can record and
+The mix slider works like the knob: click or drag along it, scroll, or
+double-click to reset, and the field next to it accepts typed values.
+
+All six are automatable parameters in both formats, so hosts can record and
 automate them. In GarageBand they appear as Smart Controls knobs. The envelope
 is linear, and every segment is at least 1 ms long so even 0 ms settings don't
 click.
@@ -69,9 +77,10 @@ Some examples to try:
 | `tanh(4sin(x))` | `0` | `2pi` |
 | `sin(x)exp(-x/4) + 0.3sign(sin(3x))` | `0` | `4pi` |
 
-The formula is sampled into a 2048-point table across `[from, to)`. The table
+Each formula is sampled into a 2048-point table across `[from, to)`. The table
 is then centred (DC removed) and peak-normalised, so any formula plays at a
-reasonable level. A formula that isn't finite anywhere in the range (for
+reasonable level. The mix is a plain crossfade of the two tables, so opposite
+waves (`sin(x)` and `-sin(x)`) cancel out at 50 %. A formula that isn't finite anywhere in the range (for
 example `1/x` across 0) is rejected.
 
 ## Building
@@ -128,16 +137,16 @@ Two minimal hosts check the built bundles without a DAW.
 ```bash
 zig build host -- info
 zig build host -- render out.wav "sin(x) + 0.3sin(5x)" 0 2pi
-zig build host -- snapshot editor.png "tanh(4sin(x))"
+zig build host -- snapshot editor.png "tanh(4sin(x))" 0 2pi "x" 0 1
 zig build host -- interact editor.png
 zig build host -- gui
 ```
 
 `host` drives the VST3. `render` loads the formula through the plugin state
 and plays an arpeggio into a WAV file. `snapshot` opens the editor off-screen,
-types the given formula/from/to into its fields and saves a PNG. `interact`
-sends mouse events to the envelope graph and the gain knob, commits a typed
-attack time, and prints the resulting parameters and the edit gestures reported
+types the given formula/from/to values (f₁'s, then f₂'s) into its fields and
+saves a PNG. `interact` sends mouse events to the envelope graph, the gain
+knob and the mix slider, commits a typed attack time, and prints the resulting parameters and the edit gestures reported
 to the host. `gui` opens the editor in a window. It has no audio output.
 
 ```bash
@@ -184,9 +193,11 @@ unit with AVAudioEngine and reports its level and measured pitch.
 
 The VST3 is a single component: one object implements `IComponent`,
 `IAudioProcessor` and `IEditController`, so the editor and the audio engine
-share state directly. Both formats save the formula, from and to strings in
-the plugin state (the AU puts them in `ClassInfo`), so projects and presets
-reopen with the same sound.
+share state directly. Both formats save both waves' formula, from and to
+strings and all parameters in the plugin state (the AU puts them in
+`ClassInfo`), so projects and presets reopen with the same sound. Projects
+saved by earlier versions still load; the second wave then starts as the
+default square at 0 % mix.
 
 The Audio Unit is identified as type `aumu`, subtype `MSyn`, manufacturer
 `Mthx`.

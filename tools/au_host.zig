@@ -2,7 +2,7 @@
 //!
 //!   au-host <bundle.component> info
 //!   au-host <bundle.component> render <out.wav> [formula from to]
-//!   au-host <bundle.component> snapshot <out.png> [formula [from [to]]]
+//!   au-host <bundle.component> snapshot <out.png> [formula1 [from1 [to1 [formula2 [from2 [to2]]]]]]
 //!   au-host <bundle.component> interact
 //!
 //! The bundle is loaded and registered in-process, so it doesn't need to be
@@ -137,25 +137,46 @@ fn getClassInfo(unit: AudioUnit) CFTypeRef {
     return dict;
 }
 
+/// Prints a saved state ("MSY1".."MSY3"): each wave's strings, then the
+/// parameters.
+fn printStateBytes(bytes: []const u8) void {
+    const version = bytes[3];
+    const waves: usize = if (version >= '3') 2 else 1;
+    var pos: usize = 4;
+    std.debug.print("plugin state ({s}):", .{bytes[0..4]});
+    for (0..waves) |w| {
+        for ([_][]const u8{ "formula", "from", "to" }) |label| {
+            const n = bytes[pos];
+            std.debug.print(" {s}{d}=\"{s}\"", .{ label, w + 1, bytes[pos + 1 ..][0..n] });
+            pos += 1 + n;
+        }
+    }
+    for ([_][]const u8{ "gain", "attack", "decay", "sustain", "release", "mix" }) |label| {
+        if (pos + 4 > bytes.len) break;
+        const v: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
+        std.debug.print(" {s}={d:.2}", .{ label, v });
+        pos += 4;
+    }
+    std.debug.print("\n", .{});
+}
+
+/// The editor's text field with the given identifier ("formula1", "attack").
+fn findField(root: Id, identifier: []const u8) Id {
+    const subviews = msg(Id, root, "subviews", .{});
+    for (0..msg(usize, subviews, "count", .{})) |i| {
+        const v = msg(Id, subviews, "objectAtIndex:", .{i});
+        if (std.mem.eql(u8, objc.utf8(msg(Id, v, "identifier", .{})), identifier)) return v;
+    }
+    fail("no field \"{s}\"", .{identifier});
+}
+
+const wave_field_ids = [_][]const u8{ "formula1", "from1", "to1", "formula2", "from2", "to2" };
+
 fn printState(unit: AudioUnit) void {
     const dict = getClassInfo(unit);
     defer CFRelease(dict);
     const data = CFDictionaryGetValue(dict, cfStr("data")) orelse fail("ClassInfo has no data", .{});
-    const bytes = CFDataGetBytePtr(data)[0..@intCast(CFDataGetLength(data))];
-    var pos: usize = 4;
-    std.debug.print("plugin state ({s}):", .{bytes[0..4]});
-    for ([_][]const u8{ "formula", "from", "to" }) |label| {
-        const n = bytes[pos];
-        std.debug.print(" {s}=\"{s}\"", .{ label, bytes[pos + 1 ..][0..n] });
-        pos += 1 + n;
-    }
-    for ([_][]const u8{ "gain", "attack", "decay", "sustain", "release" }) |label| {
-        if (pos + 4 > bytes.len) break;
-        const v: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
-        std.debug.print(" {s}={d}", .{ label, v });
-        pos += 4;
-    }
-    std.debug.print("\n", .{});
+    printStateBytes(CFDataGetBytePtr(data)[0..@intCast(CFDataGetLength(data))]);
 }
 
 /// Loads a formula the way a host restores a project: take the current
@@ -318,14 +339,8 @@ fn snapshot(unit: AudioUnit, path: [:0]const u8, texts: []const [:0]const u8) vo
     if (texts.len > 0) {
         // Container -> editor root -> fields.
         const root = msg(Id, msg(Id, view, "subviews", .{}), "firstObject", .{});
-        const subviews = msg(Id, root, "subviews", .{});
-        const text_field = objc.getClass("NSTextField");
-        var field_index: usize = 0;
-        for (0..msg(usize, subviews, "count", .{})) |i| {
-            const v = msg(Id, subviews, "objectAtIndex:", .{i});
-            if (!msg(bool, v, "isKindOfClass:", .{text_field}) or !msg(bool, v, "isEditable", .{})) continue;
-            if (field_index < texts.len) msg(void, v, "setStringValue:", .{objc.nsString(texts[field_index])});
-            field_index += 1;
+        for (texts, wave_field_ids[0..@min(texts.len, wave_field_ids.len)]) |text, id| {
+            msg(void, findField(root, id), "setStringValue:", .{objc.nsString(text)});
         }
         msg(void, root, "controlTextDidChange:", .{@as(Id, null)});
     }

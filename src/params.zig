@@ -7,12 +7,15 @@
 
 const std = @import("std");
 
+/// Numbering is part of saved projects and automation: only append.
 pub const Id = enum(u32) {
     gain,
     attack,
     decay,
     sustain,
     release,
+    /// 0 % = only wave 1, 100 % = only wave 2.
+    mix,
 };
 
 pub const count = std.enums.values(Id).len;
@@ -102,6 +105,7 @@ pub const infos = std.enums.EnumArray(Id, Info).init(.{
     .decay = .{ .name = "Decay", .short_name = "Dec", .unit = .milliseconds, .min = 0, .max = max_time_ms, .default = 250, .cubic = true },
     .sustain = .{ .name = "Sustain", .short_name = "Sus", .unit = .percent, .min = 0, .max = 100, .default = 70 },
     .release = .{ .name = "Release", .short_name = "Rel", .unit = .milliseconds, .min = 0, .max = max_time_ms, .default = 300, .cubic = true },
+    .mix = .{ .name = "Mix", .short_name = "Mix", .unit = .percent, .min = 0, .max = 100, .default = 0 },
 });
 
 pub fn info(id: Id) Info {

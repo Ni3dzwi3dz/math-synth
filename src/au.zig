@@ -871,10 +871,10 @@ export fn mathsynth_au_view_gone(ctx: *anyopaque) callconv(.c) void {
     allocator.destroy(link);
 }
 
-fn applyFromEditor(ctx: *anyopaque, settings: *const wt.Settings, table: *const wt.Table) void {
+fn applyFromEditor(ctx: *anyopaque, wave: usize, settings: *const wt.Settings, table: *const wt.Table) void {
     const link: *ViewLink = @ptrCast(@alignCast(ctx));
     const inst = link.instance orelse return; // the unit was closed under us
-    inst.engine.apply(settings, table);
+    inst.engine.apply(wave, settings, table);
     // Lets hosts that watch the state notice the change.
     inst.propertyChanged(prop_class_info, scope_global, 0);
 }

@@ -2,7 +2,7 @@
 //!
 //!   vst3-host <bundle.vst3> info
 //!   vst3-host <bundle.vst3> render <out.wav> [formula from to]
-//!   vst3-host <bundle.vst3> snapshot <out.png> [formula [from [to]]]
+//!   vst3-host <bundle.vst3> snapshot <out.png> [formula1 [from1 [to1 [formula2 [from2 [to2]]]]]]
 //!   vst3-host <bundle.vst3> interact <out.png>
 //!   vst3-host <bundle.vst3> gui
 //!
@@ -204,19 +204,45 @@ fn load(bundle: []const u8) Instance {
     return .{ .component = component, .processor = processor, .controller = controller };
 }
 
+/// Prints a saved state ("MSY1".."MSY3"): each wave's strings, then the
+/// parameters.
+fn printStateBytes(bytes: []const u8) void {
+    const version = bytes[3];
+    const waves: usize = if (version >= '3') 2 else 1;
+    var pos: usize = 4;
+    std.debug.print("plugin state ({s}):", .{bytes[0..4]});
+    for (0..waves) |w| {
+        for ([_][]const u8{ "formula", "from", "to" }) |label| {
+            const n = bytes[pos];
+            std.debug.print(" {s}{d}=\"{s}\"", .{ label, w + 1, bytes[pos + 1 ..][0..n] });
+            pos += 1 + n;
+        }
+    }
+    for ([_][]const u8{ "gain", "attack", "decay", "sustain", "release", "mix" }) |label| {
+        if (pos + 4 > bytes.len) break;
+        const v: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
+        std.debug.print(" {s}={d:.2}", .{ label, v });
+        pos += 4;
+    }
+    std.debug.print("\n", .{});
+}
+
+/// The editor's text field with the given identifier ("formula1", "attack").
+fn findField(root: Id, identifier: []const u8) Id {
+    const subviews = msg(Id, root, "subviews", .{});
+    for (0..msg(usize, subviews, "count", .{})) |i| {
+        const v = msg(Id, subviews, "objectAtIndex:", .{i});
+        if (std.mem.eql(u8, objc.utf8(msg(Id, v, "identifier", .{})), identifier)) return v;
+    }
+    fail("no field \"{s}\"", .{identifier});
+}
+
+const wave_field_ids = [_][]const u8{ "formula1", "from1", "to1", "formula2", "from2", "to2" };
+
 fn printState(inst: Instance) void {
     var s: MemStream = .{};
     check(vt(inst.component).getState.?(inst.component, &s.iface), "getState");
-    // MSY1 + three length-prefixed strings.
-    var pos: usize = 4;
-    const labels = [_][]const u8{ "formula", "from", "to" };
-    std.debug.print("plugin state:", .{});
-    for (labels) |label| {
-        const n = s.buf[pos];
-        std.debug.print(" {s}=\"{s}\"", .{ label, s.buf[pos + 1 ..][0..n] });
-        pos += 1 + n;
-    }
-    std.debug.print("\n", .{});
+    printStateBytes(s.buf[0..s.len]);
 }
 
 fn setFormula(inst: Instance, formula: []const u8, from: []const u8, to: []const u8) void {
@@ -365,21 +391,13 @@ fn openEditor(inst: Instance, visible: bool) struct { window: Id, content: Id, v
     return .{ .window = window, .content = content, .view = view, .rect = objc.NSRect.make(0, 0, rect.size.width, rect.size.height) };
 }
 
-/// Types into the editor's text fields (formula, from, to in order) and
-/// fires the same delegate callback Cocoa sends on each keystroke.
+/// Types into the editor's wave fields (formula1, from1, to1, formula2,
+/// from2, to2 in that order) and fires the delegate callback Cocoa sends on
+/// each keystroke.
 fn typeIntoEditor(content: Id, texts: []const [:0]const u8) void {
     const root = msg(Id, msg(Id, content, "subviews", .{}), "firstObject", .{});
-    const subviews = msg(Id, root, "subviews", .{});
-    const n = msg(usize, subviews, "count", .{});
-    const text_field = objc.getClass("NSTextField");
-    var field_index: usize = 0;
-    for (0..n) |i| {
-        const v = msg(Id, subviews, "objectAtIndex:", .{i});
-        if (!msg(bool, v, "isKindOfClass:", .{text_field}) or !msg(bool, v, "isEditable", .{})) continue;
-        if (field_index < texts.len) {
-            msg(void, v, "setStringValue:", .{objc.nsString(texts[field_index])});
-        }
-        field_index += 1;
+    for (texts, wave_field_ids[0..@min(texts.len, wave_field_ids.len)]) |text, id| {
+        msg(void, findField(root, id), "setStringValue:", .{objc.nsString(text)});
     }
     msg(void, root, "controlTextDidChange:", .{@as(Id, null)});
 }
@@ -474,7 +492,7 @@ fn drag(view: Id, from: objc.NSPoint, to: objc.NSPoint) void {
 }
 
 fn printParams(inst: Instance) void {
-    const names = [_][]const u8{ "gain", "attack", "decay", "sustain", "release" };
+    const names = [_][]const u8{ "gain", "attack", "decay", "sustain", "release", "mix" };
     std.debug.print("params:", .{});
     for (names, 0..) |name, i| {
         const id: c.Steinberg_Vst_ParamID = @intCast(i);
@@ -511,21 +529,18 @@ fn interact(inst: Instance, path: [:0]const u8) void {
     std.debug.print("after dragging the knob down 50 px:\n", .{});
     printParams(inst);
 
+    // Mix slider (390 px wide, 9 px inset): from 0 % to x = 9 + 0.25 * 372.
+    const slider = findSubview(root, "MathSynthSliderView");
+    drag(slider, .{ .x = 9, .y = 11 }, .{ .x = 102, .y = 11 });
+    std.debug.print("after dragging the mix slider to a quarter:\n", .{});
+    printParams(inst);
+
     // Type into the Attack field and commit it (Return / focus out).
-    const subviews = msg(Id, root, "subviews", .{});
-    const text_field = objc.getClass("NSTextField");
-    var editable: usize = 0;
-    for (0..msg(usize, subviews, "count", .{})) |i| {
-        const v = msg(Id, subviews, "objectAtIndex:", .{i});
-        if (!msg(bool, v, "isKindOfClass:", .{text_field}) or !msg(bool, v, "isEditable", .{})) continue;
-        editable += 1;
-        if (editable == 4) { // formula, from, to, then attack
-            msg(void, v, "setStringValue:", .{objc.nsString("1.2 s")});
-            const note = objc.classMsg(Id, "NSNotification", "notificationWithName:object:", .{ objc.nsString("NSControlTextDidEndEditingNotification"), v });
-            msg(void, root, "controlTextDidEndEditing:", .{note});
-            std.debug.print("attack field after typing \"1.2 s\": \"{s}\"\n", .{objc.utf8(msg(Id, v, "stringValue", .{}))});
-        }
-    }
+    const attack = findField(root, "attack");
+    msg(void, attack, "setStringValue:", .{objc.nsString("1.2 s")});
+    const note = objc.classMsg(Id, "NSNotification", "notificationWithName:object:", .{ objc.nsString("NSControlTextDidEndEditingNotification"), attack });
+    msg(void, root, "controlTextDidEndEditing:", .{note});
+    std.debug.print("attack field after typing \"1.2 s\": \"{s}\"\n", .{objc.utf8(msg(Id, attack, "stringValue", .{}))});
     printParams(inst);
     std.debug.print("gestures: begin={d} perform={d} end={d} open={d}\n", .{ handler.begins, handler.performs, handler.ends, handler.open });
 
@@ -557,7 +572,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     const args = init.args.toSlice(arena_state.allocator()) catch fail("args", .{});
     if (args.len < 3) {
-        fail("usage: vst3-host <bundle.vst3> info | render <out.wav> [formula from to] | snapshot <out.png> [formula [from [to]]] | gui", .{});
+        fail("usage: vst3-host <bundle.vst3> info | render <out.wav> [formula from to] | snapshot <out.png> [formula1 from1 to1 formula2 from2 to2] | interact <out.png> | gui", .{});
     }
     const inst = load(args[1]);
     const cmd = args[2];

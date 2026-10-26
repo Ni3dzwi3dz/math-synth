@@ -155,11 +155,16 @@ pub const Synth = struct {
     }
 
     /// Writes `out.len` samples of output to `out` (mono; caller copies to
-    /// other channels).
-    pub fn render(s: *Synth, table: *const wavetable.Table, out: []f32) void {
+    /// other channels). The two tables are crossfaded: `mix` is the share of
+    /// the second one, ramping linearly from `mix_from` to `mix_to` across
+    /// the block.
+    pub fn render(s: *Synth, tables: [2]*const wavetable.Table, mix_from: f32, mix_to: f32, out: []f32) void {
         @memset(out, 0);
+        const mix_step = if (out.len > 0) (mix_to - mix_from) / @as(f32, @floatFromInt(out.len)) else 0;
+        const only_first = mix_from == 0 and mix_to == 0;
         for (&s.voices) |*v| {
             if (!v.active) continue;
+            var mix = mix_from;
             for (out) |*sample| {
                 if (!s.stepEnvelope(v)) {
                     v.active = false;
@@ -168,15 +173,22 @@ pub const Synth = struct {
                 const pos = v.phase * wavetable.size;
                 const idx: usize = @intFromFloat(pos);
                 const frac: f32 = @floatCast(pos - @floor(pos));
-                const a = table[idx % wavetable.size];
-                const b = table[(idx + 1) % wavetable.size];
-                sample.* += (a + (b - a) * frac) * v.env * v.velocity * output_gain;
+                const at = idx % wavetable.size;
+                const next = (idx + 1) % wavetable.size;
+                var value = lerp(tables[0][at], tables[0][next], frac);
+                if (!only_first) value = lerp(value, lerp(tables[1][at], tables[1][next], frac), mix);
+                sample.* += value * v.env * v.velocity * output_gain;
                 v.phase += v.phase_inc;
                 v.phase -= @floor(v.phase);
+                mix += mix_step;
             }
         }
     }
 };
+
+fn lerp(a: f32, b: f32, t: f32) f32 {
+    return a + (b - a) * t;
+}
 
 fn testSynth(e: Envelope) Synth {
     var s: Synth = .{};
@@ -234,16 +246,35 @@ test "note plays and releases to silence" {
     var buf: [4800]f32 = undefined;
 
     s.noteOn(69, 0, 1, -1);
-    s.render(&t, &buf);
+    s.render(.{ &t, &t }, 0, 0, &buf);
     var peak: f32 = 0;
     for (buf) |x| peak = @max(peak, @abs(x));
     try std.testing.expect(peak > 0.2 and peak <= output_gain + 1e-4);
 
     s.noteOff(69, -1);
-    s.render(&t, &buf); // 100 ms > release time
+    s.render(.{ &t, &t }, 0, 0, &buf); // 100 ms > release time
     try std.testing.expect(!s.voices[0].active);
-    s.render(&t, &buf);
+    s.render(.{ &t, &t }, 0, 0, &buf);
     for (buf) |x| try std.testing.expectEqual(@as(f32, 0), x);
+}
+
+test "mix crossfades between the two tables" {
+    var ones: wavetable.Table = @splat(1);
+    var minus: wavetable.Table = @splat(-1);
+    var s: Synth = .{};
+    s.setSampleRate(1000);
+    s.setEnvelope(.{ .attack_ms = 0, .decay_ms = 0, .sustain = 1, .release_ms = 100 });
+    var buf: [4]f32 = undefined;
+    s.noteOn(69, 0, 1, -1);
+    s.render(.{ &ones, &minus }, 0, 0, &buf); // ramps up in 1 sample
+    try std.testing.expectApproxEqAbs(output_gain, buf[3], 1e-5);
+    s.render(.{ &ones, &minus }, 1, 1, &buf);
+    try std.testing.expectApproxEqAbs(-output_gain, buf[3], 1e-5);
+    s.render(.{ &ones, &minus }, 0.5, 0.5, &buf);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), buf[3], 1e-5);
+    // A ramp moves linearly across the block.
+    s.render(.{ &ones, &minus }, 0, 1, &buf);
+    try std.testing.expectApproxEqAbs(output_gain * (1 - 2 * 0.75), buf[3], 1e-5);
 }
 
 test "voice stealing reuses the oldest voice" {

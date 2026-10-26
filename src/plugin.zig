@@ -192,9 +192,9 @@ const Plugin = struct {
     }
 
     /// Editor callback: the user typed a valid formula.
-    fn applyFromEditor(ctx: *anyopaque, settings: *const wt.Settings, table: *const wt.Table) void {
+    fn applyFromEditor(ctx: *anyopaque, wave: usize, settings: *const wt.Settings, table: *const wt.Table) void {
         const p: *Plugin = @ptrCast(@alignCast(ctx));
-        p.engine.apply(settings, table);
+        p.engine.apply(wave, settings, table);
         p.markDirty();
     }
 

@@ -1,54 +1,67 @@
 //! Format-independent core shared by the VST3 and Audio Unit wrappers: the
-//! synth, the wavetable handoff to the audio thread, the user's settings and
-//! their serialised form.
+//! synth, the wavetable handoff to the audio thread, the user's settings for
+//! both waves and their serialised form.
 
 const std = @import("std");
 const wt = @import("wavetable.zig");
 const Synth = @import("synth.zig").Synth;
 const params = @import("params.zig");
 
+pub const wave_count = 2;
+/// Formula settings for both waves.
+pub const Waves = [wave_count]wt.Settings;
+pub const default_waves: Waves = .{ wt.Settings.default, wt.Settings.default_second };
+
 pub const Engine = struct {
     synth: Synth = .{},
-    tables: wt.TripleBuffer = .{},
+    tables: [wave_count]wt.TripleBuffer = .{ .{}, .{} },
     params: params.Values = .{},
     /// Output gain as currently applied, smoothed towards the parameter.
     gain: f32 = 1,
+    /// Wave 2 share (0..1) as currently applied, smoothed towards the mix
+    /// parameter.
+    mix: f32 = 0,
 
     /// Guards `settings`, which the UI writes and state saving may read from
     /// another thread.
     settings_lock: std.atomic.Value(bool) = .init(false),
-    settings: wt.Settings = wt.Settings.default,
+    settings: Waves = default_waves,
 
     pub fn init(e: *Engine) void {
         e.* = .{};
-        var table: wt.Table = undefined;
-        std.debug.assert(wt.build(&e.settings, &table) == .ok);
-        e.tables.initWith(&table);
+        for (&e.tables, &e.settings) |*tb, *settings| {
+            var table: wt.Table = undefined;
+            std.debug.assert(wt.build(settings, &table) == .ok);
+            tb.initWith(&table);
+        }
+        e.mix = e.params.get(.mix) / 100.0;
         e.synth.setSampleRate(44100);
     }
 
-    pub fn currentSettings(e: *Engine) wt.Settings {
+    pub fn currentSettings(e: *Engine) Waves {
         e.lock();
         defer e.unlock();
         return e.settings;
     }
 
-    /// Stores validated settings and hands the matching table to the audio
-    /// thread.
-    pub fn apply(e: *Engine, settings: *const wt.Settings, table: *const wt.Table) void {
-        e.tables.beginWrite().* = table.*;
-        e.tables.publish();
+    /// Stores validated settings for one wave and hands the matching table
+    /// to the audio thread.
+    pub fn apply(e: *Engine, wave: usize, settings: *const wt.Settings, table: *const wt.Table) void {
+        e.tables[wave].beginWrite().* = table.*;
+        e.tables[wave].publish();
         e.lock();
-        e.settings = settings.*;
+        e.settings[wave] = settings.*;
         e.unlock();
     }
 
     /// Validates and applies saved state. Returns false (changing nothing)
-    /// if the formula doesn't compile.
+    /// if either formula doesn't compile.
     pub fn load(e: *Engine, state: *const State) bool {
-        var table: wt.Table = undefined;
-        if (wt.build(&state.settings, &table) != .ok) return false;
-        e.apply(&state.settings, &table);
+        var tables: [wave_count]wt.Table = undefined;
+        for (&state.settings, &tables) |*settings, *table| {
+            if (wt.build(settings, table) != .ok) return false;
+        }
+        for (&state.settings, &tables, 0..) |*settings, *table, wave| e.apply(wave, settings, table);
         for (std.enums.values(params.Id), state.params) |id, v| e.params.set(id, v);
         return true;
     }
@@ -65,7 +78,15 @@ pub const Engine = struct {
     /// Renders frames [from, to) into each channel. Audio thread only.
     pub fn render(e: *Engine, channels: []const [*]f32, from: usize, to: usize) void {
         if (to <= from) return;
-        const table = e.tables.read();
+        const tables = [wave_count]*const wt.Table{ e.tables[0].read(), e.tables[1].read() };
+        // Move the mix towards its target with the same ~10 ms smoothing as
+        // the gain, as a linear ramp across this segment.
+        const mix_from = e.mix;
+        const mix_target = e.params.get(.mix) / 100.0;
+        const k = 1.0 - @exp(-1.0 / (0.01 * e.synth.sample_rate));
+        const decay: f32 = @floatCast(std.math.pow(f64, 1.0 - k, @floatFromInt(to - from)));
+        const mix_to = mix_target + (mix_from - mix_target) * decay;
+        e.mix = mix_to;
         e.synth.setEnvelope(.{
             .attack_ms = e.params.get(.attack),
             .decay_ms = e.params.get(.decay),
@@ -78,13 +99,13 @@ pub const Engine = struct {
             var at = from;
             while (at < to) {
                 const n = @min(scratch.len, to - at);
-                e.synth.render(table, scratch[0..n]);
+                e.synth.render(tables, mix_to, mix_to, scratch[0..n]);
                 at += n;
             }
             return;
         }
         const first = channels[0][from..to];
-        e.synth.render(table, first);
+        e.synth.render(tables, mix_from, mix_to, first);
         e.applyGain(first);
         for (channels[1..]) |ch| @memcpy(ch[from..to], first);
     }
@@ -112,7 +133,7 @@ pub const Engine = struct {
 
 /// Everything saved with a project or preset.
 pub const State = struct {
-    settings: wt.Settings,
+    settings: Waves = default_waves,
     params: [params.count]f32 = defaultParams(),
 
     fn defaultParams() [params.count]f32 {
@@ -122,21 +143,24 @@ pub const State = struct {
     }
 };
 
-// Saved state: "MSY2", then formula, from and to, each as a u8 length
-// followed by UTF-8 bytes, then the parameters as little-endian f32 in
-// `params.Id` order. "MSY1" is the same without parameters.
-const magic_v1 = "MSY1";
-const magic_v2 = "MSY2";
-pub const max_state_len = 4 + 3 + wt.max_formula_len + 2 * wt.max_range_len + 4 * params.count;
+// Saved state, version 3: "MSY3", then for each wave the formula, from and
+// to as a u8 length followed by UTF-8 bytes, then the parameters as
+// little-endian f32 in `params.Id` order.
+// Version 2 ("MSY2") has one wave; version 1 ("MSY1") also has no
+// parameters. Older states load with defaults for what they lack.
+const magic = "MSY3";
+pub const max_state_len = 4 + wave_count * (3 + wt.max_formula_len + 2 * wt.max_range_len) + 4 * params.count;
 
 pub fn serialize(state: *const State, buf: *[max_state_len]u8) []const u8 {
-    @memcpy(buf[0..4], magic_v2);
+    @memcpy(buf[0..4], magic);
     var n: usize = 4;
-    for (std.enums.values(wt.Field)) |field| {
-        const s = state.settings.get(field);
-        buf[n] = @intCast(s.len);
-        @memcpy(buf[n + 1 ..][0..s.len], s);
-        n += 1 + s.len;
+    for (&state.settings) |*settings| {
+        for (std.enums.values(wt.Field)) |field| {
+            const s = settings.get(field);
+            buf[n] = @intCast(s.len);
+            @memcpy(buf[n + 1 ..][0..s.len], s);
+            n += 1 + s.len;
+        }
     }
     for (state.params) |v| {
         std.mem.writeInt(u32, buf[n..][0..4], @bitCast(v), .little);
@@ -146,21 +170,29 @@ pub fn serialize(state: *const State, buf: *[max_state_len]u8) []const u8 {
 }
 
 pub fn deserialize(data: []const u8) ?State {
-    if (data.len < 4) return null;
-    const v2 = std.mem.eql(u8, data[0..4], magic_v2);
-    if (!v2 and !std.mem.eql(u8, data[0..4], magic_v1)) return null;
-    var state: State = .{ .settings = .{} };
+    if (data.len < 4 or !std.mem.eql(u8, data[0..3], "MSY")) return null;
+    const version: u8 = switch (data[3]) {
+        '1' => 1,
+        '2' => 2,
+        '3' => 3,
+        else => return null,
+    };
+    var state: State = .{};
     var n: usize = 4;
-    for (std.enums.values(wt.Field)) |field| {
-        if (n >= data.len) return null;
-        const len = data[n];
-        if (len > wt.Settings.maxLen(field) or n + 1 + len > data.len) return null;
-        state.settings.set(field, data[n + 1 ..][0..len]);
-        n += 1 + len;
+    const waves: usize = if (version >= 3) wave_count else 1;
+    for (state.settings[0..waves]) |*settings| {
+        settings.* = .{};
+        for (std.enums.values(wt.Field)) |field| {
+            if (n >= data.len) return null;
+            const len = data[n];
+            if (len > wt.Settings.maxLen(field) or n + 1 + len > data.len) return null;
+            settings.set(field, data[n + 1 ..][0..len]);
+            n += 1 + len;
+        }
     }
-    if (v2) {
-        // Tolerate states with fewer parameters (from an older version):
-        // missing ones keep their defaults.
+    if (version >= 2) {
+        // Parameters missing at the end (added in a later version) keep
+        // their defaults.
         for (std.enums.values(params.Id)) |id| {
             if (n + 4 > data.len) break;
             const v: f32 = @bitCast(std.mem.readInt(u32, data[n..][0..4], .little));
@@ -173,18 +205,40 @@ pub fn deserialize(data: []const u8) ?State {
 
 test "state round trip" {
     var buf: [max_state_len]u8 = undefined;
-    var in: State = .{ .settings = wt.Settings.init("sin(x) + 0.5sin(2x)", "-pi", "pi") };
+    var in: State = .{ .settings = .{
+        wt.Settings.init("sin(x) + 0.5sin(2x)", "-pi", "pi"),
+        wt.Settings.init("x", "0", "1"),
+    } };
     in.params[@intFromEnum(params.Id.gain)] = -6;
     in.params[@intFromEnum(params.Id.release)] = 1234;
+    in.params[@intFromEnum(params.Id.mix)] = 40;
     const out = deserialize(serialize(&in, &buf)).?;
-    for (std.enums.values(wt.Field)) |f| try std.testing.expectEqualStrings(in.settings.get(f), out.settings.get(f));
+    for (0..wave_count) |w| {
+        for (std.enums.values(wt.Field)) |f| try std.testing.expectEqualStrings(in.settings[w].get(f), out.settings[w].get(f));
+    }
     try std.testing.expectEqualSlices(f32, &in.params, &out.params);
 }
 
-test "version 1 state loads with default parameters" {
+test "version 1 state loads with defaults for the rest" {
     const out = deserialize("MSY1\x01x\x010\x011").?;
-    try std.testing.expectEqualStrings("x", out.settings.get(.formula));
+    try std.testing.expectEqualStrings("x", out.settings[0].get(.formula));
+    try std.testing.expectEqualStrings(wt.Settings.default_second.get(.formula), out.settings[1].get(.formula));
     try std.testing.expectEqual(params.info(.sustain).default, out.params[@intFromEnum(params.Id.sustain)]);
+}
+
+test "version 2 state keeps its parameters and gets the default second wave" {
+    var buf: [64]u8 = undefined;
+    @memcpy(buf[0..10], "MSY2\x01x\x010\x011");
+    var n: usize = 10;
+    for (0..5) |i| { // v2 had five parameters
+        std.mem.writeInt(u32, buf[n..][0..4], @bitCast(@as(f32, @floatFromInt(i)) + 1), .little);
+        n += 4;
+    }
+    const out = deserialize(buf[0..n]).?;
+    try std.testing.expectEqual(@as(f32, 1), out.params[@intFromEnum(params.Id.gain)]);
+    try std.testing.expectEqual(@as(f32, 5), out.params[@intFromEnum(params.Id.release)]);
+    try std.testing.expectEqual(@as(f32, 0), out.params[@intFromEnum(params.Id.mix)]);
+    try std.testing.expectEqualStrings(wt.Settings.default_second.get(.formula), out.settings[1].get(.formula));
 }
 
 test "gain is applied and smoothed" {

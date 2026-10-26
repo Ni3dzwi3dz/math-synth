@@ -23,6 +23,8 @@ pub const Settings = struct {
     to_len: u8 = 0,
 
     pub const default: Settings = init("sin(x)", "0", "2*pi");
+    /// Default for the second wave: a square, so the mix is easy to hear.
+    pub const default_second: Settings = init("sign(sin(x))", "0", "2*pi");
 
     pub fn init(formula: []const u8, from: []const u8, to: []const u8) Settings {
         var s: Settings = .{};
