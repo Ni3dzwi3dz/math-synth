@@ -10,6 +10,7 @@ const wt = @import("wavetable.zig");
 const engine = @import("engine.zig");
 const Engine = engine.Engine;
 const gui = @import("gui/editor.zig");
+const params = @import("params.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -115,6 +116,55 @@ const AudioBufferList = extern struct {
 };
 
 const ChannelInfo = extern struct { inChannels: i16, outChannels: i16 };
+
+const ParameterInfo = extern struct {
+    name: [52]u8 = @splat(0),
+    unitName: CFTypeRef = null,
+    clumpID: u32 = 0,
+    cfNameString: CFTypeRef = null,
+    unit: u32 = 0,
+    minValue: f32 = 0,
+    maxValue: f32 = 0,
+    defaultValue: f32 = 0,
+    flags: u32 = 0,
+};
+
+const param_flag_readable: u32 = 0x40000000;
+const param_flag_writable: u32 = 0x80000000;
+const param_flag_has_cf_name: u32 = 0x08000000;
+const param_flag_cf_name_release: u32 = 0x10;
+const param_flag_display_cubed: u32 = 0x30000;
+
+const unit_percent: u32 = 3;
+const unit_decibels: u32 = 13;
+const unit_milliseconds: u32 = 24;
+
+const ParameterEvent = extern struct {
+    scope: u32,
+    element: u32,
+    parameter: u32,
+    event_type: u32, // 1 = immediate, 2 = ramped
+    args: extern union {
+        ramp: extern struct { start_offset: i32, duration: u32, start_value: f32, end_value: f32 },
+        immediate: extern struct { offset: u32, value: f32 },
+    },
+};
+
+/// AudioUnitParameter, for AUParameterSet and parameter events.
+const ParameterRef = extern struct { unit: AudioUnit, id: u32, scope: u32, element: u32 };
+const UnitEvent = extern struct {
+    event_type: u32, // 0 = value change, 1 = begin gesture, 2 = end gesture
+    parameter: ParameterRef,
+};
+comptime {
+    // Sizes measured against the macOS SDK headers.
+    std.debug.assert(@sizeOf(ParameterInfo) == 104 and @offsetOf(ParameterInfo, "unit") == 80);
+    std.debug.assert(@sizeOf(ParameterEvent) == 32);
+    std.debug.assert(@sizeOf(ParameterRef) == 24 and @sizeOf(UnitEvent) == 32 and @offsetOf(UnitEvent, "parameter") == 8);
+}
+extern fn AUParameterSet(listener: ?*anyopaque, sender: ?*anyopaque, param: *const ParameterRef, value: f32, offset: u32) OSStatus;
+extern fn AUParameterListenerNotify(listener: ?*anyopaque, sender: ?*anyopaque, param: *const ParameterRef) OSStatus;
+extern fn AUEventListenerNotify(listener: ?*anyopaque, sender: ?*anyopaque, event: *const UnitEvent) OSStatus;
 const CocoaViewInfo = extern struct { bundle_location: CFTypeRef, view_class: [1]CFTypeRef };
 const Preset = extern struct { presetNumber: i32, presetName: CFTypeRef };
 
@@ -298,6 +348,10 @@ const Instance = struct {
     }
 
     /// Settings were loaded from a project or preset: refresh open editors.
+    fn paramRef(inst: *const Instance, id: params.Id) ParameterRef {
+        return .{ .unit = inst.unit, .id = @intFromEnum(id), .scope = scope_global, .element = 0 };
+    }
+
     fn refreshEditors(inst: *Instance) void {
         if (pthread_main_np() == 0) return; // Cocoa views are main-thread only
         const settings = inst.engine.currentSettings();
@@ -417,8 +471,10 @@ fn describe(id: u32, scope: u32, element: u32) Described {
         prop_sample_rate => if (output_el0 or global_only) info(f64, true) else bad,
         prop_stream_format => if (output_el0) info(StreamFormat, true) else bad,
         prop_should_allocate_buffer => if (output_el0) info(u32, true) else bad,
-        prop_parameter_list => if (scope <= scope_output) .{ .info = .{ .size = 0, .writable = false } } else bad,
-        prop_parameter_info => .{ .err = err_invalid_parameter },
+        prop_parameter_list => if (global_only)
+            .{ .info = .{ .size = 4 * params.count, .writable = false } }
+        else if (scope <= scope_output) .{ .info = .{ .size = 0, .writable = false } } else bad,
+        prop_parameter_info => if (global_only and params.fromIndex(element) != null) info(ParameterInfo, false) else .{ .err = err_invalid_parameter },
         prop_element_count => if (scope <= scope_output) info(u32, false) else bad,
         prop_latency, prop_tail_time => if (global_only) info(f64, false) else bad,
         prop_supported_num_channels => if (global_only) .{ .info = .{ .size = @sizeOf(ChannelInfo) * supported_channels.len, .writable = false } } else bad,
@@ -468,7 +524,11 @@ fn getProperty(self: *anyopaque, id: u32, scope: u32, element: u32, out: ?*anyop
         prop_should_allocate_buffer => write(u32, dst, @intFromBool(inst.allocate_buffers)),
         prop_element_count => write(u32, dst, if (scope == scope_input) 0 else 1),
         prop_latency => write(f64, dst, 0),
-        prop_tail_time => write(f64, dst, engine.tail_seconds),
+        prop_tail_time => write(f64, dst, inst.engine.tailSeconds()),
+        prop_parameter_list => for (0..params.count) |i| {
+            @as([*]align(1) u32, @ptrCast(dst))[i] = @intCast(i);
+        },
+        prop_parameter_info => write(ParameterInfo, dst, parameterInfo(params.fromIndex(element).?)),
         prop_supported_num_channels => @as(*[supported_channels.len]ChannelInfo, @ptrCast(@alignCast(dst))).* = supported_channels,
         prop_maximum_frames_per_slice => write(u32, dst, inst.max_frames),
         prop_last_render_error => {
@@ -505,10 +565,12 @@ fn setProperty(self: *anyopaque, id: u32, scope: u32, element: u32, data: ?*cons
 
     switch (id) {
         prop_class_info => {
-            const settings = settingsFromClassInfo(read(CFTypeRef, src)) orelse return err_invalid_property_value;
-            if (!inst.engine.load(&settings)) return err_invalid_property_value;
+            const state = stateFromClassInfo(read(CFTypeRef, src)) orelse return err_invalid_property_value;
+            if (!inst.engine.load(&state)) return err_invalid_property_value;
             inst.refreshEditors();
             inst.propertyChanged(prop_class_info, scope_global, 0);
+            // Let hosts (and their generic controls) pick up the restored values.
+            for (std.enums.values(params.Id)) |pid| _ = AUParameterListenerNotify(null, null, &inst.paramRef(pid));
         },
         prop_sample_rate => {
             const rate = read(f64, src);
@@ -562,13 +624,13 @@ fn classInfo(inst: *Instance) CFTypeRef {
     dictSetInt(dict, "manufacturer", @bitCast(component_manufacturer));
     dictSet(dict, "name", CFRetain(inst.preset_name));
     var buf: [engine.max_state_len]u8 = undefined;
-    const settings = inst.engine.currentSettings();
-    const bytes = engine.serialize(&settings, &buf);
+    const state = inst.engine.saveState();
+    const bytes = engine.serialize(&state, &buf);
     dictSet(dict, "data", CFDataCreate(null, bytes.ptr, @intCast(bytes.len)));
     return dict;
 }
 
-fn settingsFromClassInfo(dict: CFTypeRef) ?wt.Settings {
+fn stateFromClassInfo(dict: CFTypeRef) ?engine.State {
     if (dict == null or CFGetTypeID(dict) != CFDictionaryGetTypeID()) return null;
     const data = dictGet(dict, "data");
     if (data == null or CFGetTypeID(data) != CFDataGetTypeID()) return null;
@@ -644,16 +706,55 @@ fn removeRenderNotify(self: *anyopaque, proc: RenderCallback, ref: ?*anyopaque) 
     return no_err;
 }
 
-// Parameters: there are none yet.
+// Parameters -------------------------------------------------------------------
 
-fn getParameter(_: *anyopaque, _: u32, _: u32, _: u32, _: ?*f32) callconv(.c) OSStatus {
-    return err_invalid_parameter;
+fn parameterInfo(id: params.Id) ParameterInfo {
+    const i = params.info(id);
+    var out: ParameterInfo = .{
+        .unit = switch (i.unit) {
+            .decibels => unit_decibels,
+            .milliseconds => unit_milliseconds,
+            .percent => unit_percent,
+        },
+        .minValue = i.min,
+        .maxValue = i.max,
+        .defaultValue = i.default,
+        .flags = param_flag_readable | param_flag_writable | param_flag_has_cf_name | param_flag_cf_name_release |
+            (if (i.cubic) param_flag_display_cubed else 0),
+        .cfNameString = cfString(i.name), // released by the host (CFNameRelease)
+    };
+    @memcpy(out.name[0..i.name.len], i.name);
+    return out;
 }
-fn setParameter(_: *anyopaque, _: u32, _: u32, _: u32, _: f32, _: u32) callconv(.c) OSStatus {
-    return err_invalid_parameter;
+
+fn getParameter(self: *anyopaque, raw_id: u32, scope: u32, element: u32, out: ?*f32) callconv(.c) OSStatus {
+    if (scope != scope_global) return err_invalid_scope;
+    if (element != 0) return err_invalid_element;
+    const id = params.fromIndex(raw_id) orelse return err_invalid_parameter;
+    (out orelse return param_err).* = Instance.from(self).engine.params.get(id);
+    return no_err;
 }
-fn scheduleParameters(_: *anyopaque, _: ?*const anyopaque, count: u32) callconv(.c) OSStatus {
-    return if (count == 0) no_err else err_invalid_parameter;
+
+fn setParameter(self: *anyopaque, raw_id: u32, scope: u32, element: u32, value: f32, _: u32) callconv(.c) OSStatus {
+    if (scope != scope_global) return err_invalid_scope;
+    if (element != 0) return err_invalid_element;
+    const id = params.fromIndex(raw_id) orelse return err_invalid_parameter;
+    // Values are applied per render call, so the buffer offset is ignored.
+    Instance.from(self).engine.params.set(id, value);
+    return no_err;
+}
+
+fn scheduleParameters(self: *anyopaque, events: ?[*]const ParameterEvent, count: u32) callconv(.c) OSStatus {
+    if (count == 0) return no_err;
+    const list = events orelse return param_err;
+    for (list[0..count]) |e| {
+        // Ramps jump straight to their end value; the gain smoothing and the
+        // envelope hide the step.
+        const value = if (e.event_type == 2) e.args.ramp.end_value else e.args.immediate.value;
+        const r = setParameter(self, e.parameter, e.scope, e.element, value, 0);
+        if (r != no_err) return r;
+    }
+    return no_err;
 }
 
 // MIDI -------------------------------------------------------------------------
@@ -748,7 +849,14 @@ export fn mathsynth_au_make_view(unit: AudioUnit) callconv(.c) ?*anyopaque {
     };
     slot.* = link;
     const settings = inst.engine.currentSettings();
-    link.editor = gui.Editor.create(allocator, container, .{ .ctx = link, .apply = applyFromEditor }, &settings) catch null;
+    link.editor = gui.Editor.create(allocator, container, .{
+        .ctx = link,
+        .apply = applyFromEditor,
+        .get_param = editorGetParam,
+        .begin_edit = editorBeginEdit,
+        .set_param = editorSetParam,
+        .end_edit = editorEndEdit,
+    }, &settings) catch null;
     return mathsynth_au_autorelease(container);
 }
 
@@ -771,8 +879,37 @@ fn applyFromEditor(ctx: *anyopaque, settings: *const wt.Settings, table: *const 
     inst.propertyChanged(prop_class_info, scope_global, 0);
 }
 
+fn linkInstance(ctx: *anyopaque) ?*Instance {
+    const link: *ViewLink = @ptrCast(@alignCast(ctx));
+    return link.instance;
+}
+
+fn editorGetParam(ctx: *anyopaque, id: params.Id) f32 {
+    const inst = linkInstance(ctx) orelse return params.info(id).default;
+    return inst.engine.params.get(id);
+}
+
+// Edits go through the AudioUnit API so hosts see them: AUParameterSet calls
+// our SetParameter and notifies parameter listeners (automation, Smart
+// Controls); the gesture events mark the start and end of a drag.
+fn editorBeginEdit(ctx: *anyopaque, id: params.Id) void {
+    const inst = linkInstance(ctx) orelse return;
+    _ = AUEventListenerNotify(null, null, &.{ .event_type = 1, .parameter = inst.paramRef(id) });
+}
+
+fn editorSetParam(ctx: *anyopaque, id: params.Id, plain: f32) void {
+    const inst = linkInstance(ctx) orelse return;
+    _ = AUParameterSet(null, null, &inst.paramRef(id), params.info(id).clamp(plain), 0);
+}
+
+fn editorEndEdit(ctx: *anyopaque, id: params.Id) void {
+    const inst = linkInstance(ctx) orelse return;
+    _ = AUEventListenerNotify(null, null, &.{ .event_type = 2, .parameter = inst.paramRef(id) });
+}
+
 test {
     _ = @import("engine.zig");
+    _ = @import("params.zig");
 }
 
 test "midi queue keeps order and drops when full" {

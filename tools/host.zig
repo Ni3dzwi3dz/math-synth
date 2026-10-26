@@ -3,11 +3,15 @@
 //!   vst3-host <bundle.vst3> info
 //!   vst3-host <bundle.vst3> render <out.wav> [formula from to]
 //!   vst3-host <bundle.vst3> snapshot <out.png> [formula [from [to]]]
+//!   vst3-host <bundle.vst3> interact <out.png>
 //!   vst3-host <bundle.vst3> gui
 //!
 //! `render` loads the formula through IComponent::setState and plays a short
 //! arpeggio. `snapshot` opens the editor off-screen, optionally types into its
 //! fields like a user would, saves a PNG and prints the resulting plugin state.
+//! `interact` sends mouse events to the envelope graph and the gain knob and
+//! commits a typed envelope value, then prints the parameters and the edit
+//! gestures the plugin reported to the host.
 
 const std = @import("std");
 const c = @import("vst3");
@@ -397,6 +401,145 @@ fn snapshot(inst: Instance, path: [:0]const u8, texts: []const [:0]const u8) voi
     printState(inst);
 }
 
+/// Records the edit gestures the plugin reports.
+const Handler = struct {
+    iface: c.struct_Steinberg_Vst_IComponentHandler = .{ .lpVtbl = &vtbl },
+    begins: u32 = 0,
+    performs: u32 = 0,
+    ends: u32 = 0,
+    open: i32 = 0, // begins minus ends; must end at 0
+
+    var vtbl: c.struct_Steinberg_Vst_IComponentHandlerVtbl = .{
+        .queryInterface = noQuery,
+        .addRef = staticRef,
+        .release = staticRef,
+        .beginEdit = beginEdit,
+        .performEdit = performEdit,
+        .endEdit = endEdit,
+        .restartComponent = restart,
+    };
+    fn from(this: ?*anyopaque) *Handler {
+        return @fieldParentPtr("iface", @as(*c.struct_Steinberg_Vst_IComponentHandler, @ptrCast(@alignCast(this.?))));
+    }
+    fn beginEdit(this: ?*anyopaque, _: c.Steinberg_Vst_ParamID) callconv(.c) tresult {
+        from(this).begins += 1;
+        from(this).open += 1;
+        return ok;
+    }
+    fn performEdit(this: ?*anyopaque, _: c.Steinberg_Vst_ParamID, _: c.Steinberg_Vst_ParamValue) callconv(.c) tresult {
+        const h = from(this);
+        if (h.open <= 0) fail("performEdit outside beginEdit/endEdit", .{});
+        h.performs += 1;
+        return ok;
+    }
+    fn endEdit(this: ?*anyopaque, _: c.Steinberg_Vst_ParamID) callconv(.c) tresult {
+        from(this).ends += 1;
+        from(this).open -= 1;
+        return ok;
+    }
+    fn restart(_: ?*anyopaque, _: i32) callconv(.c) tresult {
+        return ok;
+    }
+};
+
+fn findSubview(root: Id, class_prefix: []const u8) Id {
+    const subviews = msg(Id, root, "subviews", .{});
+    for (0..msg(usize, subviews, "count", .{})) |i| {
+        const v = msg(Id, subviews, "objectAtIndex:", .{i});
+        const name = objc.utf8(msg(Id, v, "className", .{}));
+        if (std.mem.startsWith(u8, name, class_prefix)) return v;
+    }
+    fail("no subview of class {s}", .{class_prefix});
+}
+
+/// Sends a left-mouse event at `p` (in `view`'s coordinates) straight to
+/// the view's handler.
+fn mouse(view: Id, comptime selector: [*:0]const u8, event_type: usize, p: objc.NSPoint, clicks: isize, flags: usize) void {
+    const in_window = msg(objc.NSPoint, view, "convertPoint:toView:", .{ p, @as(Id, null) });
+    const window = msg(Id, view, "window", .{});
+    const event = objc.classMsg(Id, "NSEvent", "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:", .{
+        event_type, in_window, flags, @as(f64, 0), msg(isize, window, "windowNumber", .{}), @as(Id, null), @as(isize, 0), clicks, @as(f32, 1),
+    });
+    msg(void, view, selector, .{event});
+}
+
+fn drag(view: Id, from: objc.NSPoint, to: objc.NSPoint) void {
+    mouse(view, "mouseDown:", 1, from, 1, 0);
+    // A few intermediate steps, like a real drag.
+    for (1..5) |i| {
+        const f: f64 = @as(f64, @floatFromInt(i)) / 4;
+        mouse(view, "mouseDragged:", 6, .{ .x = from.x + (to.x - from.x) * f, .y = from.y + (to.y - from.y) * f }, 1, 0);
+    }
+    mouse(view, "mouseUp:", 2, to, 1, 0);
+}
+
+fn printParams(inst: Instance) void {
+    const names = [_][]const u8{ "gain", "attack", "decay", "sustain", "release" };
+    std.debug.print("params:", .{});
+    for (names, 0..) |name, i| {
+        const id: c.Steinberg_Vst_ParamID = @intCast(i);
+        const n = vt(inst.controller).getParamNormalized.?(inst.controller, id);
+        const plain = vt(inst.controller).normalizedParamToPlain.?(inst.controller, id, n);
+        var text: c.Steinberg_Vst_String128 = undefined;
+        _ = vt(inst.controller).getParamStringByValue.?(inst.controller, id, n, &text);
+        var ascii: [128]u8 = undefined;
+        var len: usize = 0;
+        while (len < 127 and text[len] != 0) : (len += 1) ascii[len] = @intCast(text[len]);
+        std.debug.print(" {s}={d:.2} (\"{s}\")", .{ name, plain, ascii[0..len] });
+    }
+    std.debug.print("\n", .{});
+}
+
+fn interact(inst: Instance, path: [:0]const u8) void {
+    var handler: Handler = .{};
+    check(vt(inst.controller).setComponentHandler.?(inst.controller, &handler.iface), "setComponentHandler");
+    const ed = openEditor(inst, false);
+    const root = msg(Id, msg(Id, ed.content, "subviews", .{}), "firstObject", .{});
+    printParams(inst);
+
+    // Defaults (A 5 ms, D 250 ms, S 70 %, R 300 ms) in a 470x150 graph with a
+    // 1 s span put the decay/sustain point at (108.68, 99.4). Drag it to
+    // (160, 50): decay = (160 - 15.856) / 371.28 s = 388 ms, sustain = 29.5 %.
+    const env = findSubview(root, "MathSynthEnvelopeView");
+    drag(env, .{ .x = 108.68, .y = 99.4 }, .{ .x = 160, .y = 50 });
+    std.debug.print("after dragging the decay point:\n", .{});
+    printParams(inst);
+
+    // Knob: 50 px down = a quarter of the range = 18 dB, from 0 to -18 dB.
+    const knob = findSubview(root, "MathSynthKnobView");
+    drag(knob, .{ .x = 50, .y = 50 }, .{ .x = 50, .y = 0 });
+    std.debug.print("after dragging the knob down 50 px:\n", .{});
+    printParams(inst);
+
+    // Type into the Attack field and commit it (Return / focus out).
+    const subviews = msg(Id, root, "subviews", .{});
+    const text_field = objc.getClass("NSTextField");
+    var editable: usize = 0;
+    for (0..msg(usize, subviews, "count", .{})) |i| {
+        const v = msg(Id, subviews, "objectAtIndex:", .{i});
+        if (!msg(bool, v, "isKindOfClass:", .{text_field}) or !msg(bool, v, "isEditable", .{})) continue;
+        editable += 1;
+        if (editable == 4) { // formula, from, to, then attack
+            msg(void, v, "setStringValue:", .{objc.nsString("1.2 s")});
+            const note = objc.classMsg(Id, "NSNotification", "notificationWithName:object:", .{ objc.nsString("NSControlTextDidEndEditingNotification"), v });
+            msg(void, root, "controlTextDidEndEditing:", .{note});
+            std.debug.print("attack field after typing \"1.2 s\": \"{s}\"\n", .{objc.utf8(msg(Id, v, "stringValue", .{}))});
+        }
+    }
+    printParams(inst);
+    std.debug.print("gestures: begin={d} perform={d} end={d} open={d}\n", .{ handler.begins, handler.performs, handler.ends, handler.open });
+
+    const rep = msg(Id, ed.content, "bitmapImageRepForCachingDisplayInRect:", .{ed.rect});
+    msg(void, ed.content, "cacheDisplayInRect:toBitmapImageRep:", .{ ed.rect, rep });
+    const png = msg(Id, rep, "representationUsingType:properties:", .{ @as(usize, 4), objc.classMsg(Id, "NSDictionary", "dictionary", .{}) });
+    if (!msg(bool, png, "writeToFile:atomically:", .{ objc.nsString(path), objc.YES })) fail("could not write {s}", .{path});
+    std.debug.print("wrote {s}\n", .{path});
+
+    check(vt(ed.view).removed.?(ed.view), "IPlugView::removed");
+    _ = vt(ed.view).release.?(ed.view);
+    _ = vt(inst.controller).setComponentHandler.?(inst.controller, null);
+}
+
 fn gui(inst: Instance) void {
     const ed = openEditor(inst, true);
     const app = objc.classMsg(Id, "NSApplication", "sharedApplication", .{});
@@ -426,6 +569,8 @@ pub fn main(init: std.process.Init.Minimal) void {
         render(inst, args[3]);
     } else if (std.mem.eql(u8, cmd, "snapshot") and args.len >= 4) {
         snapshot(inst, args[3], args[4..]);
+    } else if (std.mem.eql(u8, cmd, "interact") and args.len >= 4) {
+        interact(inst, args[3]);
     } else if (std.mem.eql(u8, cmd, "gui")) {
         gui(inst);
     } else {

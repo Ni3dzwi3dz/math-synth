@@ -10,6 +10,7 @@ const c = @import("vst3");
 const wt = @import("wavetable.zig");
 const engine = @import("engine.zig");
 const Engine = engine.Engine;
+const params = @import("params.zig");
 const gui = @import("gui/editor.zig");
 
 pub const name = "MathSynth";
@@ -197,6 +198,58 @@ const Plugin = struct {
         p.markDirty();
     }
 
+    fn editorModel(p: *Plugin) gui.Model {
+        return .{
+            .ctx = p,
+            .apply = applyFromEditor,
+            .get_param = editorGetParam,
+            .begin_edit = editorBeginEdit,
+            .set_param = editorSetParam,
+            .end_edit = editorEndEdit,
+        };
+    }
+
+    fn editorGetParam(ctx: *anyopaque, id: params.Id) f32 {
+        const p: *Plugin = @ptrCast(@alignCast(ctx));
+        return p.engine.params.get(id);
+    }
+
+    // Edits from the editor go straight into the shared engine (single
+    // component) and are reported to the host so it can record automation.
+    fn editorBeginEdit(ctx: *anyopaque, id: params.Id) void {
+        const p: *Plugin = @ptrCast(@alignCast(ctx));
+        if (p.handler) |h| _ = h.lpVtbl.*.beginEdit.?(h, @intFromEnum(id));
+    }
+
+    fn editorSetParam(ctx: *anyopaque, id: params.Id, plain: f32) void {
+        const p: *Plugin = @ptrCast(@alignCast(ctx));
+        p.engine.params.set(id, plain);
+        const normalized = params.info(id).toNormalized(p.engine.params.get(id));
+        if (p.handler) |h| _ = h.lpVtbl.*.performEdit.?(h, @intFromEnum(id), normalized);
+    }
+
+    fn editorEndEdit(ctx: *anyopaque, id: params.Id) void {
+        const p: *Plugin = @ptrCast(@alignCast(ctx));
+        if (p.handler) |h| _ = h.lpVtbl.*.endEdit.?(h, @intFromEnum(id));
+    }
+
+    /// Automation and host-side edits arrive as parameter changes in
+    /// process(). Only the last point of each queue is used.
+    fn readParameterChanges(p: *Plugin, changes: *c.struct_Steinberg_Vst_IParameterChanges) void {
+        const n = changes.lpVtbl.*.getParameterCount.?(changes);
+        var i: i32 = 0;
+        while (i < n) : (i += 1) {
+            const queue = changes.lpVtbl.*.getParameterData.?(changes, i) orelse continue;
+            const id = params.fromIndex(queue.*.lpVtbl.*.getParameterId.?(queue)) orelse continue;
+            const points = queue.*.lpVtbl.*.getPointCount.?(queue);
+            if (points <= 0) continue;
+            var offset: i32 = 0;
+            var value: f64 = 0;
+            if (queue.*.lpVtbl.*.getPoint.?(queue, points - 1, &offset, &value) != ok) continue;
+            p.engine.params.set(id, params.info(id).fromNormalized(value));
+        }
+    }
+
     /// Tells the host the project has unsaved changes (there are no
     /// automatable parameters that would do this for us).
     fn markDirty(p: *Plugin) void {
@@ -216,6 +269,7 @@ const Plugin = struct {
     fn process(p: *Plugin, data: *c.struct_Steinberg_Vst_ProcessData) void {
         const frames: usize = @intCast(@max(data.numSamples, 0));
         const synth = &p.engine.synth;
+        if (data.inputParameterChanges) |changes| p.readParameterChanges(changes);
 
         var channels: []const [*]f32 = &.{};
         if (data.numOutputs > 0 and data.outputs != null and data.outputs[0].numChannels > 0) {
@@ -259,15 +313,15 @@ const Plugin = struct {
     }
 };
 
-fn writeState(stream: [*c]c.struct_Steinberg_IBStream, settings: *const wt.Settings) tresult {
+fn writeState(stream: [*c]c.struct_Steinberg_IBStream, state: *const engine.State) tresult {
     var buf: [engine.max_state_len]u8 = undefined;
-    const data = engine.serialize(settings, &buf);
+    const data = engine.serialize(state, &buf);
     var written: i32 = 0;
     const r = stream.*.lpVtbl.*.write.?(stream, @constCast(data.ptr), @intCast(data.len), &written);
     return if (r == ok and written == data.len) ok else false_result;
 }
 
-fn readState(stream: [*c]c.struct_Steinberg_IBStream) ?wt.Settings {
+fn readState(stream: [*c]c.struct_Steinberg_IBStream) ?engine.State {
     var buf: [1024]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
@@ -364,18 +418,19 @@ fn setActive(this: ?*anyopaque, state: c.Steinberg_TBool) callconv(.c) tresult {
 fn componentSetState(this: ?*anyopaque, stream: [*c]c.struct_Steinberg_IBStream) callconv(.c) tresult {
     if (stream == null) return invalid_argument;
     const p = Plugin.fromIface("component", this);
-    const settings = readState(stream) orelse return false_result;
-    if (!p.engine.load(&settings)) return false_result;
-    // VST3 calls setState on the UI thread, so the editor can be updated here.
-    if (p.editor) |e| e.load(&settings);
+    const state = readState(stream) orelse return false_result;
+    if (!p.engine.load(&state)) return false_result;
+    // VST3 calls setState on the UI thread, so the editor can be updated
+    // here. It picks up the parameters on its next refresh.
+    if (p.editor) |e| e.load(&state.settings);
     return ok;
 }
 
 fn componentGetState(this: ?*anyopaque, stream: [*c]c.struct_Steinberg_IBStream) callconv(.c) tresult {
     if (stream == null) return invalid_argument;
     const p = Plugin.fromIface("component", this);
-    const settings = p.engine.currentSettings();
-    return writeState(stream, &settings);
+    const state = p.engine.saveState();
+    return writeState(stream, &state);
 }
 
 // IAudioProcessor -------------------------------------------------------------
@@ -446,7 +501,7 @@ fn processAudio(this: ?*anyopaque, data: [*c]c.struct_Steinberg_Vst_ProcessData)
 
 fn getTailSamples(this: ?*anyopaque) callconv(.c) u32 {
     const p = Plugin.fromIface("processor", this);
-    return @intFromFloat(@ceil(p.engine.synth.sample_rate * engine.tail_seconds));
+    return @intFromFloat(@ceil(p.engine.synth.sample_rate * p.engine.tailSeconds()) + 64);
 }
 
 // IEditController -------------------------------------------------------------
@@ -501,28 +556,71 @@ fn controllerGetState(_: ?*anyopaque, _: [*c]c.struct_Steinberg_IBStream) callco
 }
 
 fn getParameterCount(_: ?*anyopaque) callconv(.c) i32 {
-    return 0;
+    return params.count;
 }
-fn getParameterInfo(_: ?*anyopaque, _: i32, _: [*c]c.struct_Steinberg_Vst_ParameterInfo) callconv(.c) tresult {
-    return invalid_argument;
+
+fn getParameterInfo(_: ?*anyopaque, index: i32, out: [*c]c.struct_Steinberg_Vst_ParameterInfo) callconv(.c) tresult {
+    const id = params.fromIndex(index) orelse return invalid_argument;
+    if (out == null) return invalid_argument;
+    const i = params.info(id);
+    out.* = .{
+        .id = @intFromEnum(id),
+        .stepCount = 0,
+        .defaultNormalizedValue = i.toNormalized(i.default),
+        .unitId = c.Steinberg_Vst_kRootUnitId,
+        .flags = c.Steinberg_Vst_ParameterInfo_ParameterFlags_kCanAutomate,
+    };
+    copyString128(&out.*.title, i.name);
+    copyString128(&out.*.shortTitle, i.short_name);
+    copyString128(&out.*.units, i.unitLabel());
+    return ok;
 }
-fn getParamStringByValue(_: ?*anyopaque, _: c.Steinberg_Vst_ParamID, _: c.Steinberg_Vst_ParamValue, _: [*c]c.Steinberg_Vst_TChar) callconv(.c) tresult {
-    return invalid_argument;
+
+fn getParamStringByValue(_: ?*anyopaque, raw_id: c.Steinberg_Vst_ParamID, normalized: c.Steinberg_Vst_ParamValue, out: [*c]c.Steinberg_Vst_TChar) callconv(.c) tresult {
+    const id = params.fromIndex(raw_id) orelse return invalid_argument;
+    if (out == null) return invalid_argument;
+    const i = params.info(id);
+    var buf: [32]u8 = undefined;
+    copyString128(@ptrCast(out), i.format(&buf, i.fromNormalized(normalized)));
+    return ok;
 }
-fn getParamValueByString(_: ?*anyopaque, _: c.Steinberg_Vst_ParamID, _: [*c]c.Steinberg_Vst_TChar, _: [*c]c.Steinberg_Vst_ParamValue) callconv(.c) tresult {
-    return invalid_argument;
+
+fn getParamValueByString(_: ?*anyopaque, raw_id: c.Steinberg_Vst_ParamID, text: [*c]c.Steinberg_Vst_TChar, out: [*c]c.Steinberg_Vst_ParamValue) callconv(.c) tresult {
+    const id = params.fromIndex(raw_id) orelse return invalid_argument;
+    if (text == null or out == null) return invalid_argument;
+    // UTF-16 to ASCII; anything else can't be a number anyway.
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    while (n < buf.len and text[n] != 0) : (n += 1) {
+        const ch: u16 = @bitCast(text[n]);
+        buf[n] = if (ch < 128) @intCast(ch) else '?';
+    }
+    const i = params.info(id);
+    const plain = i.parse(buf[0..n]) orelse return false_result;
+    out.* = i.toNormalized(plain);
+    return ok;
 }
-fn normalizedParamToPlain(_: ?*anyopaque, _: c.Steinberg_Vst_ParamID, v: c.Steinberg_Vst_ParamValue) callconv(.c) c.Steinberg_Vst_ParamValue {
-    return v;
+
+fn normalizedParamToPlain(_: ?*anyopaque, raw_id: c.Steinberg_Vst_ParamID, v: c.Steinberg_Vst_ParamValue) callconv(.c) c.Steinberg_Vst_ParamValue {
+    const id = params.fromIndex(raw_id) orelse return v;
+    return params.info(id).fromNormalized(v);
 }
-fn plainParamToNormalized(_: ?*anyopaque, _: c.Steinberg_Vst_ParamID, v: c.Steinberg_Vst_ParamValue) callconv(.c) c.Steinberg_Vst_ParamValue {
-    return v;
+
+fn plainParamToNormalized(_: ?*anyopaque, raw_id: c.Steinberg_Vst_ParamID, v: c.Steinberg_Vst_ParamValue) callconv(.c) c.Steinberg_Vst_ParamValue {
+    const id = params.fromIndex(raw_id) orelse return v;
+    return params.info(id).toNormalized(@floatCast(v));
 }
-fn getParamNormalized(_: ?*anyopaque, _: c.Steinberg_Vst_ParamID) callconv(.c) c.Steinberg_Vst_ParamValue {
-    return 0;
+
+fn getParamNormalized(this: ?*anyopaque, raw_id: c.Steinberg_Vst_ParamID) callconv(.c) c.Steinberg_Vst_ParamValue {
+    const id = params.fromIndex(raw_id) orelse return 0;
+    return params.info(id).toNormalized(Plugin.fromIface("controller", this).engine.params.get(id));
 }
-fn setParamNormalized(_: ?*anyopaque, _: c.Steinberg_Vst_ParamID, _: c.Steinberg_Vst_ParamValue) callconv(.c) tresult {
-    return invalid_argument;
+
+fn setParamNormalized(this: ?*anyopaque, raw_id: c.Steinberg_Vst_ParamID, v: c.Steinberg_Vst_ParamValue) callconv(.c) tresult {
+    const id = params.fromIndex(raw_id) orelse return invalid_argument;
+    // The editor polls the values, so it follows this too.
+    Plugin.fromIface("controller", this).engine.params.set(id, params.info(id).fromNormalized(v));
+    return ok;
 }
 
 fn setComponentHandler(this: ?*anyopaque, handler: [*c]c.struct_Steinberg_Vst_IComponentHandler) callconv(.c) tresult {
@@ -616,7 +714,7 @@ fn viewAttached(this: ?*anyopaque, parent: ?*anyopaque, platform: c.Steinberg_FI
     v.detach();
     const p = v.plugin;
     const settings = p.engine.currentSettings();
-    p.editor = gui.Editor.create(allocator, parent, .{ .ctx = p, .apply = Plugin.applyFromEditor }, &settings) catch return false_result;
+    p.editor = gui.Editor.create(allocator, parent, p.editorModel(), &settings) catch return false_result;
     return ok;
 }
 

@@ -3,6 +3,7 @@
 //!   au-host <bundle.component> info
 //!   au-host <bundle.component> render <out.wav> [formula from to]
 //!   au-host <bundle.component> snapshot <out.png> [formula [from [to]]]
+//!   au-host <bundle.component> interact
 //!
 //! The bundle is loaded and registered in-process, so it doesn't need to be
 //! installed. After that the host only uses the public AudioUnit API: state
@@ -142,11 +143,17 @@ fn printState(unit: AudioUnit) void {
     const data = CFDictionaryGetValue(dict, cfStr("data")) orelse fail("ClassInfo has no data", .{});
     const bytes = CFDataGetBytePtr(data)[0..@intCast(CFDataGetLength(data))];
     var pos: usize = 4;
-    std.debug.print("plugin state:", .{});
+    std.debug.print("plugin state ({s}):", .{bytes[0..4]});
     for ([_][]const u8{ "formula", "from", "to" }) |label| {
         const n = bytes[pos];
         std.debug.print(" {s}=\"{s}\"", .{ label, bytes[pos + 1 ..][0..n] });
         pos += 1 + n;
+    }
+    for ([_][]const u8{ "gain", "attack", "decay", "sustain", "release" }) |label| {
+        if (pos + 4 > bytes.len) break;
+        const v: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
+        std.debug.print(" {s}={d}", .{ label, v });
+        pos += 4;
     }
     std.debug.print("\n", .{});
 }
@@ -258,7 +265,11 @@ fn writeWav(path: [:0]const u8, samples: []const f32, rate: u32) void {
     }
 }
 
-fn snapshot(unit: AudioUnit, path: [:0]const u8, texts: []const [:0]const u8) void {
+const OpenView = struct { factory: Id, view: Id, window: Id, content: Id, rect: objc.NSRect };
+
+/// Creates the editor the way Apple's sample hosts do and puts it in an
+/// off-screen window.
+fn openView(unit: AudioUnit) OpenView {
     _ = objc.classMsg(Id, "NSApplication", "sharedApplication", .{});
 
     var info: CocoaViewInfo = undefined;
@@ -267,8 +278,7 @@ fn snapshot(unit: AudioUnit, path: [:0]const u8, texts: []const [:0]const u8) vo
     defer CFRelease(info.bundle_location);
     defer CFRelease(info.view_class[0]);
 
-    // The same lookup Apple's sample hosts use: the class must belong to the
-    // bundle and conform to AUCocoaUIBase.
+    // The class must belong to the bundle and conform to AUCocoaUIBase.
     const url: Id = @ptrCast(info.bundle_location);
     const view_bundle = objc.classMsg(Id, "NSBundle", "bundleWithURL:", .{url});
     const class_name: Id = @ptrCast(info.view_class[0]);
@@ -283,11 +293,27 @@ fn snapshot(unit: AudioUnit, path: [:0]const u8, texts: []const [:0]const u8) vo
         fail("uiViewForAudioUnit returned nil", .{});
     _ = msg(Id, view, "retain", .{});
 
-    const rect = objc.NSRect.make(0, 0, 660, 480);
+    const frame = msg(objc.NSRect, view, "frame", .{});
+    const rect = objc.NSRect.make(0, 0, frame.size.width, frame.size.height);
     const window = msg(Id, objc.alloc(objc.getClass("NSWindow")), "initWithContentRect:styleMask:backing:defer:", .{ rect, @as(usize, 1), @as(usize, 2), objc.NO });
     msg(void, window, "setReleasedWhenClosed:", .{objc.NO});
     const content = msg(Id, window, "contentView", .{});
     msg(void, content, "addSubview:", .{view});
+    return .{ .factory = factory, .view = view, .window = window, .content = content, .rect = rect };
+}
+
+fn closeView(v: OpenView) void {
+    // Like a host closing the editor: remove and release the view.
+    msg(void, v.view, "removeFromSuperview", .{});
+    objc.release(v.view);
+    objc.release(v.factory);
+}
+
+fn snapshot(unit: AudioUnit, path: [:0]const u8, texts: []const [:0]const u8) void {
+    const ov = openView(unit);
+    const view = ov.view;
+    const content = ov.content;
+    const rect = ov.rect;
 
     if (texts.len > 0) {
         // Container -> editor root -> fields.
@@ -310,10 +336,76 @@ fn snapshot(unit: AudioUnit, path: [:0]const u8, texts: []const [:0]const u8) vo
     if (!msg(bool, png, "writeToFile:atomically:", .{ objc.nsString(path), objc.YES })) fail("could not write {s}", .{path});
     std.debug.print("wrote {s}\n", .{path});
 
-    // Close the editor like a host would: remove and release the view.
-    msg(void, view, "removeFromSuperview", .{});
-    objc.release(view);
-    objc.release(factory);
+    closeView(ov);
+    printState(unit);
+}
+
+const UnitParameter = extern struct { unit: AudioUnit, id: u32, scope: u32, element: u32 };
+const UnitEvent = extern struct { event_type: u32, parameter: UnitParameter };
+extern fn AUEventListenerCreate(proc: *const fn (?*anyopaque, ?*anyopaque, *const UnitEvent, u64, f32) callconv(.c) void, ref: ?*anyopaque, run_loop: ?*anyopaque, mode: CFTypeRef, interval: f32, granularity: f32, out: *?*anyopaque) OSStatus;
+extern fn AUEventListenerAddEventType(listener: ?*anyopaque, object: ?*anyopaque, event: *const UnitEvent) OSStatus;
+extern fn AUListenerDispose(listener: ?*anyopaque) OSStatus;
+extern fn CFRunLoopGetCurrent() ?*anyopaque;
+extern fn CFRunLoopRunInMode(mode: CFTypeRef, seconds: f64, return_after_source: bool) i32;
+extern var kCFRunLoopDefaultMode: CFTypeRef;
+extern fn AudioUnitGetParameter(unit: AudioUnit, id: u32, scope: u32, element: u32, value: *f32) OSStatus;
+
+/// What a host's parameter listener saw: [value changes, begins, ends].
+var seen: [3]u32 = .{ 0, 0, 0 };
+var last_gain: f32 = std.math.nan(f32);
+
+fn onEvent(_: ?*anyopaque, _: ?*anyopaque, event: *const UnitEvent, _: u64, value: f32) callconv(.c) void {
+    if (event.event_type > 2) return;
+    seen[event.event_type] += 1;
+    if (event.event_type == 0 and event.parameter.id == 0) last_gain = value;
+}
+
+/// Drags the gain knob through the AU's own editor and checks that a host
+/// listening for parameter events (as GarageBand does for automation and
+/// Smart Controls) is told about it.
+fn interact(unit: AudioUnit) void {
+    var listener: ?*anyopaque = null;
+    check(AUEventListenerCreate(onEvent, null, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode, 0.005, 0, &listener), "AUEventListenerCreate");
+    for ([_]u32{ 0, 1, 2 }) |event_type| {
+        for (0..5) |id| {
+            const e: UnitEvent = .{ .event_type = event_type, .parameter = .{ .unit = unit, .id = @intCast(id), .scope = scope_global, .element = 0 } };
+            check(AUEventListenerAddEventType(listener, null, &e), "AUEventListenerAddEventType");
+        }
+    }
+
+    const ov = openView(unit);
+    const root = msg(Id, msg(Id, ov.view, "subviews", .{}), "firstObject", .{});
+    const subviews = msg(Id, root, "subviews", .{});
+    var knob: Id = null;
+    for (0..msg(usize, subviews, "count", .{})) |i| {
+        const v = msg(Id, subviews, "objectAtIndex:", .{i});
+        if (std.mem.startsWith(u8, objc.utf8(msg(Id, v, "className", .{})), "MathSynthKnobView")) knob = v;
+    }
+    if (knob == null) fail("no knob view", .{});
+
+    // 50 px down: 0 dB -> -18 dB.
+    const window_number = msg(isize, ov.window, "windowNumber", .{});
+    const steps = [_]struct { [*:0]const u8, usize, f64 }{
+        .{ "mouseDown:", 1, 50 }, .{ "mouseDragged:", 6, 37.5 }, .{ "mouseDragged:", 6, 25 },
+        .{ "mouseDragged:", 6, 12.5 }, .{ "mouseDragged:", 6, 0 }, .{ "mouseUp:", 2, 0 },
+    };
+    for (steps) |step| {
+        const in_window = msg(objc.NSPoint, knob, "convertPoint:toView:", .{ objc.NSPoint{ .x = 50, .y = step[2] }, @as(Id, null) });
+        const event = objc.classMsg(Id, "NSEvent", "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:", .{
+            step[1], in_window, @as(usize, 0), @as(f64, 0), window_number, @as(Id, null), @as(isize, 0), @as(isize, 1), @as(f32, 1),
+        });
+        const sel_name = std.mem.span(step[0]);
+        if (std.mem.eql(u8, sel_name, "mouseDown:")) msg(void, knob, "mouseDown:", .{event}) else if (std.mem.eql(u8, sel_name, "mouseUp:")) msg(void, knob, "mouseUp:", .{event}) else msg(void, knob, "mouseDragged:", .{event});
+    }
+    // Listener callbacks are delivered on the run loop.
+    _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.3, false);
+
+    var gain: f32 = 0;
+    check(AudioUnitGetParameter(unit, 0, scope_global, 0, &gain), "AudioUnitGetParameter");
+    std.debug.print("gain parameter after knob drag: {d:.2} dB\n", .{gain});
+    std.debug.print("host listener saw: value changes={d} (last gain {d:.2}) begin gestures={d} end gestures={d}\n", .{ seen[0], last_gain, seen[1], seen[2] });
+    closeView(ov);
+    _ = AUListenerDispose(listener);
     printState(unit);
 }
 
@@ -333,6 +425,8 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (args.len >= 7) setFormula(unit, .{ args[4], args[5], args[6] });
         printState(unit);
         render(unit, args[3]);
+    } else if (std.mem.eql(u8, cmd, "interact")) {
+        interact(unit);
     } else if (std.mem.eql(u8, cmd, "snapshot") and args.len >= 4) {
         snapshot(unit, args[3], args[4..]);
     } else {

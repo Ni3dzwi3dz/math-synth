@@ -12,6 +12,36 @@ on every keystroke: valid input updates the preview and the sound right away.
 Invalid input shows the error and points at it, and the last valid waveform
 keeps playing.
 
+Below the waveform are an ADSR envelope and an output gain knob.
+
+## Envelope and gain
+
+- **Envelope graph:** drag the points to shape the envelope. The peak sets
+  attack, the next point sets decay and sustain, the end of the sustain hold
+  sets sustain, and the last point sets release. Double-click a point to reset
+  it. Time runs left to right and the view zooms to fit the envelope after
+  each drag. The dashed line marks note-off; release times are measured from
+  there.
+- **Attack, Decay, Sustain, Release fields:** type a value and press Return.
+  Times accept `ms` or `s` (`250`, `250 ms`, `1.5 s`), and sustain is a
+  percentage.
+- **Gain knob:** drag up or down (hold Shift for fine steps), scroll, or
+  double-click to reset to 0 dB. You can also type a value in the field
+  below it.
+
+| Parameter | Range | Default |
+|---|---|---|
+| Gain | -60 dB (silent) to +12 dB | 0 dB |
+| Attack | 0 to 10 000 ms | 5 ms |
+| Decay | 0 to 10 000 ms | 250 ms |
+| Sustain | 0 to 100 % | 70 % |
+| Release | 0 to 10 000 ms | 300 ms |
+
+All five are automatable parameters in both formats, so hosts can record and
+automate them. In GarageBand they appear as Smart Controls knobs. The envelope
+is linear, and every segment is at least 1 ms long so even 0 ms settings don't
+click.
+
 ## Formula language
 
 | | |
@@ -99,25 +129,30 @@ Two minimal hosts check the built bundles without a DAW.
 zig build host -- info
 zig build host -- render out.wav "sin(x) + 0.3sin(5x)" 0 2pi
 zig build host -- snapshot editor.png "tanh(4sin(x))"
+zig build host -- interact editor.png
 zig build host -- gui
 ```
 
 `host` drives the VST3. `render` loads the formula through the plugin state
 and plays an arpeggio into a WAV file. `snapshot` opens the editor off-screen,
-types the given formula/from/to into its fields and saves a PNG. `gui` opens
-the editor in a window. It has no audio output.
+types the given formula/from/to into its fields and saves a PNG. `interact`
+sends mouse events to the envelope graph and the gain knob, commits a typed
+attack time, and prints the resulting parameters and the edit gestures reported
+to the host. `gui` opens the editor in a window. It has no audio output.
 
 ```bash
 zig build au-host -- info
 zig build au-host -- render out.wav x 0 1
 zig build au-host -- snapshot editor.png "sin(x"
+zig build au-host -- interact
 ```
 
 `au-host` does the same for the Audio Unit without installing it. It
 registers the component in-process, then only uses the public Audio Unit API:
 state goes through `ClassInfo`, notes through `MusicDeviceMIDIEvent`, and the
 editor is created through the `CocoaUI` view factory, the way Logic and
-GarageBand do it.
+GarageBand do it. `interact` drags the gain knob in that editor and checks
+that a host-style parameter listener receives the value changes and gestures.
 
 GarageBand and Logic run third-party Audio Units in a separate helper process
 (`AUHostingService`) and show the editor remotely. To check that path against
@@ -136,13 +171,15 @@ unit with AVAudioEngine and reports its level and measured pitch.
 |---|---|
 | `src/expr.zig` | Tokenizer, recursive-descent parser and stack-machine evaluator, with error positions |
 | `src/wavetable.zig` | Input validation, table building, lock-free triple buffer to the audio thread |
-| `src/synth.zig` | 16-voice wavetable oscillator with attack/release |
-| `src/engine.zig` | Format-independent core: synth, table handoff, settings and saved state |
+| `src/params.zig` | Gain and ADSR parameters: ranges, defaults, normalized mapping, text formatting and parsing |
+| `src/synth.zig` | 16-voice wavetable oscillator with a linear ADSR envelope |
+| `src/engine.zig` | Format-independent core: synth, table handoff, parameters, gain, saved state |
 | `src/plugin.zig` | VST3 factory, component/processor/controller, plug view |
 | `src/au.zig` | Audio Unit v2 music device: properties, MIDI queue, render, view factory glue |
 | `src/au_view.m` | The AU view factory class (Objective-C, because AU hosts look it up by name in the bundle) |
 | `src/gui/objc.zig` | Thin Objective-C runtime and CoreGraphics bindings |
 | `src/gui/editor.zig` | The Cocoa editor, shared by both formats |
+| `src/gui/envelope_graph.zig` | Geometry of the envelope graph: point positions, hit testing, drag mapping |
 | `vendor/vst3_c_api` | Steinberg's VST3 C API header (BSD-3 licence), translated with `translate-c` at build time |
 
 The VST3 is a single component: one object implements `IComponent`,
@@ -158,8 +195,6 @@ The Audio Unit is identified as type `aumu`, subtype `MSyn`, manufacturer
 
 - macOS only. The DSP and VST3 parts are portable, but there is no
   Windows or Linux editor yet.
-- The Audio Unit is v2 and expects to run in the host's process. GarageBand
-  and Logic do this for native Apple Silicon plugins.
+- Parameter changes take effect once per audio block rather than at exact
+  sample positions. Gain is smoothed, so this isn't audible as steps.
 - No band-limiting, so harsh shapes (saw, square) alias on high notes.
-- There are no automatable parameters yet, so envelope times and gain are
-  fixed.

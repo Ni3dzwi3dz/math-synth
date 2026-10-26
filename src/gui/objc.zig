@@ -66,7 +66,8 @@ pub fn msg(comptime Ret: type, target: anytype, selector: [*:0]const u8, args: a
         3 => return @as(*const fn (Id, Sel, fields[0].type, fields[1].type, fields[2].type) callconv(.c) Ret, @ptrCast(f))(t, s, args[0], args[1], args[2]),
         4 => return @as(*const fn (Id, Sel, fields[0].type, fields[1].type, fields[2].type, fields[3].type) callconv(.c) Ret, @ptrCast(f))(t, s, args[0], args[1], args[2], args[3]),
         5 => return @as(*const fn (Id, Sel, fields[0].type, fields[1].type, fields[2].type, fields[3].type, fields[4].type) callconv(.c) Ret, @ptrCast(f))(t, s, args[0], args[1], args[2], args[3], args[4]),
-        else => @compileError("too many arguments"),
+        9 => return @as(*const fn (Id, Sel, fields[0].type, fields[1].type, fields[2].type, fields[3].type, fields[4].type, fields[5].type, fields[6].type, fields[7].type, fields[8].type) callconv(.c) Ret, @ptrCast(f))(t, s, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8]),
+        else => @compileError("unsupported argument count"),
     }
 }
 
@@ -166,6 +167,31 @@ pub extern fn CGContextClosePath(c: CGContext) void;
 pub extern fn CGContextFillPath(c: CGContext) void;
 pub extern fn CGContextStrokePath(c: CGContext) void;
 pub extern fn CGContextSetLineJoin(c: CGContext, join: i32) void;
+
+pub extern fn CGContextSetLineCap(c: CGContext, cap: i32) void;
+pub extern fn CGContextAddArc(c: CGContext, x: CGFloat, y: CGFloat, radius: CGFloat, start: CGFloat, end: CGFloat, clockwise: i32) void;
+pub extern fn CGContextFillEllipseInRect(c: CGContext, rect: NSRect) void;
+pub extern fn CGContextStrokeEllipseInRect(c: CGContext, rect: NSRect) void;
+
+extern var NSFontAttributeName: Id;
+extern var NSForegroundColorAttributeName: Id;
+
+/// Draws text with its baseline-ish origin at (x, y) in the current view's
+/// coordinates. Only for use inside drawRect:.
+pub fn drawText(text: []const u8, x: CGFloat, y: CGFloat, font: Id, text_color: Id) void {
+    var keys = [_]Id{ NSFontAttributeName, NSForegroundColorAttributeName };
+    var values = [_]Id{ font, text_color };
+    const attrs = classMsg(Id, "NSDictionary", "dictionaryWithObjects:forKeys:count:", .{ @as([*]Id, &values), @as([*]Id, &keys), @as(usize, 2) });
+    msg(void, nsString(text), "drawAtPoint:withAttributes:", .{ NSPoint{ .x = x, .y = y }, attrs });
+}
+
+/// Width of `text` in `font`.
+pub fn textWidth(text: []const u8, font: Id) CGFloat {
+    var keys = [_]Id{NSFontAttributeName};
+    var values = [_]Id{font};
+    const attrs = classMsg(Id, "NSDictionary", "dictionaryWithObjects:forKeys:count:", .{ @as([*]Id, &values), @as([*]Id, &keys), @as(usize, 1) });
+    return msg(NSSize, nsString(text), "sizeWithAttributes:", .{attrs}).width;
+}
 
 pub fn currentCGContext() CGContext {
     const ns_ctx = classMsg(Id, "NSGraphicsContext", "currentContext", .{});
